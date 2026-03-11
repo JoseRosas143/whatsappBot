@@ -95,8 +95,8 @@ async function bumpVisitasIfNewDay(telefono) {
   const last = cliente.ultimo_mensaje ? new Date(cliente.ultimo_mensaje) : null;
   const shouldInc = !last || !sameDay(last, now);
 
-  const patch = { ultimo_mensaje: now.toISOString() };
-  if (shouldInc) patch.visitas = Number(cliente.visitas || 0) + 1;
+ // const patch = { ultimo_mensaje: now.toISOString() };
+ // if (shouldInc) patch.visitas = Number(cliente.visitas || 0) + 1;
 
   const { data, error } = await supabase.from("clientes").update(patch).eq("telefono", telefono).select("*").maybeSingle();
   if (error) throw new Error(error.message);
@@ -145,6 +145,18 @@ async function asegurar_orden_abierta(telefono, numero_mesa_opcional) {
       .select("*")
       .maybeSingle();
     if (error) throw new Error(error.message);
+
+    // --- AQUÍ SUMAMOS LA VISITA SOLO CUANDO ES UNA CUENTA NUEVA ---
+    try {
+      const { data: client } = await supabase.from("clientes").select("visitas").eq("telefono", telefono).maybeSingle();
+      if (client) {
+        await supabase.from("clientes").update({ visitas: (client.visitas || 0) + 1 }).eq("telefono", telefono);
+      }
+    } catch (err) {
+      console.error("Error sumando visita:", err);
+    }
+    // --------------------------------------------------------------
+
     return { ok: true, orden: data, created: true };
   }
 
@@ -165,6 +177,11 @@ async function recalcAndUpdateOrderTotal(ordenId) {
   const { error: updErr } = await supabase.from("ordenes").update({ total }).eq("id", ordenId);
   if (updErr) throw new Error(updErr.message);
   return total;
+}
+
+// Función auxiliar para quitar acentos y normalizar texto
+function quitarAcentos(str) {
+  return String(str || "").normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase().trim();
 }
 
 async function previsualizar_pedido(telefono, numero_mesa, items) {
@@ -192,18 +209,21 @@ async function previsualizar_pedido(telefono, numero_mesa, items) {
     .eq("disponible", true);
   if (menuAllErr) throw new Error(menuAllErr.message);
 
+  // --- NUEVO: Mapa de búsqueda sin acentos ---
   const menuMapExact = new Map((menuAll || []).map((m) => [m.nombre, m]));
-  const menuMapLower = new Map((menuAll || []).map((m) => [String(m.nombre).toLowerCase(), m.nombre]));
+  const menuMapFlexible = new Map((menuAll || []).map((m) => [quitarAcentos(m.nombre), m]));
 
   for (const it of normalized) {
-    if (!menuMapExact.has(it.producto_nombre)) {
-      const fixed = menuMapLower.get(String(it.producto_nombre).toLowerCase());
-      if (fixed) it.producto_nombre = fixed;
+    const searchName = quitarAcentos(it.producto_nombre);
+    if (menuMapFlexible.has(searchName)) {
+      // Si hace match sin acentos, forzamos el nombre EXACTO de la base de datos
+      it.producto_nombre = menuMapFlexible.get(searchName).nombre;
     }
   }
 
   const nombres = [...new Set(normalized.map((x) => x.producto_nombre))];
   const missing = nombres.filter((n) => !menuMapExact.has(n));
+  
   if (missing.length) {
     const alternativas = (menuAll || []).slice(0, 8).map((m) => ({ nombre: m.nombre, categoria: m.categoria, precio: m.precio }));
     return { ok: false, error: "PRODUCTOS_NO_DISPONIBLES", missing, alternativas };
@@ -241,88 +261,114 @@ async function previsualizar_pedido(telefono, numero_mesa, items) {
 
   return { ok: true, orden_id: orden.id, numero_mesa: orden.numero_mesa, pendientes: pendientes || [], total_pendiente: totalPendiente, total_orden: total };
 }
+async function cancelar_item_sin_enviar(telefono, producto, consumidor_opcional = null) {
+  try {
+    const orden = await getLatestOrderByPhone(telefono, ["abierta", "pendiente_pago"]);
+    if (!orden) return { ok: false, error: "NO_ORDER" };
 
-async function cancelar_item_sin_enviar(telefono, producto, consumidor_opcional) {
-  telefono = normalizePhone(telefono);
-  assertNonEmpty(telefono, "telefono");
-  const prod = String(producto || "").trim();
-  assertNonEmpty(prod, "producto");
+    // Limpiamos un poco el nombre que manda la IA (quitamos 'con queso', etc para buscar mejor)
+    const palabraClave = producto.split(" ")[0]; // Ej: Si manda "Choripan con queso", solo busca "Choripan"
 
-  const consumidor = consumidor_opcional ? String(consumidor_opcional).trim() : null;
+    // Buscamos el platillo usando .ilike() que permite buscar coincidencias parciales sin importar mayúsculas
+    let query = supabase
+      .from("detalle_orden") // ⚠️ CAMBIA ESTO por el nombre real de tu tabla (ej: orden_items)
+      .select("*")
+      .eq("orden_id", orden.id)
+      .eq("enviado_cocina", false)
+      .ilike("producto_nombre", `%${palabraClave}%`); 
 
-  const orden = await getLatestOrderByPhone(telefono, ["abierta", "pendiente_pago"]);
-  if (!orden) return { ok: false, error: "NO_HAY_ORDEN" };
+    if (consumidor_opcional && consumidor_opcional !== "General") {
+      query = query.eq("consumidor", consumidor_opcional);
+    }
 
-  let q = supabase
-    .from("detalle_orden")
-    .select("id,producto_nombre,consumidor,enviado_cocina,fecha_creacion")
-    .eq("orden_id", orden.id)
-    .eq("enviado_cocina", false)
-    .eq("producto_nombre", prod)
-    .order("fecha_creacion", { ascending: false })
-    .limit(1);
+    const { data: items, error: errSearch } = await query;
 
-  if (consumidor) q = q.eq("consumidor", consumidor);
+    if (errSearch) throw errSearch;
+    if (!items || items.length === 0) return { ok: false, error: "No encontré ese platillo en los pendientes." };
 
-  const { data, error } = await q;
-  if (error) throw new Error(error.message);
+    // Borramos el primer platillo que coincida (por si pidió 2 y solo quiere quitar 1)
+    const itemABorrar = items[0];
+    
+    const { error: errDelete } = await supabase
+      .from("detalle_orden") // ⚠️ CAMBIA ESTO TAMBIÉN
+      .delete()
+      .eq("id", itemABorrar.id);
 
-  const row = data?.[0];
-  if (!row) return { ok: false, error: "NO_EXISTE_ITEM_PENDIENTE" };
+    if (errDelete) throw errDelete;
 
-  const { error: delErr } = await supabase.from("detalle_orden").delete().eq("id", row.id);
-  if (delErr) throw new Error(delErr.message);
-
-  await recalcAndUpdateOrderTotal(orden.id);
-  return { ok: true, deleted_id: row.id, producto: row.producto_nombre };
+    return { ok: true, producto: itemABorrar.producto_nombre, message: "Item eliminado correctamente." };
+  } catch (err) {
+    console.error("Error cancelar_item:", err);
+    return { ok: false, error: err.message };
+  }
 }
 
 async function confirmar_comanda_cocina(telefono) {
   telefono = normalizePhone(telefono);
   assertNonEmpty(telefono, "telefono");
 
-  const cliente = await getCliente(telefono);
-  const orden = await getLatestOrderByPhone(telefono, ["abierta", "pendiente_pago"]);
-  if (!orden) return { ok: false, error: "NO_HAY_ORDEN" };
-  if (!orden.numero_mesa) return { ok: false, error: "FALTA_MESA" };
+  try {
+    // 1. Buscamos la orden
+    const orden = await getLatestOrderByPhone(telefono, ["abierta", "pendiente_pago"]);
+    if (!orden) return { ok: false, error: "NO_ORDER" };
+    if (!orden.numero_mesa) return { ok: false, error: "FALTA_MESA" };
 
-  const { data: enviadosAhora, error: updErr } = await supabase
-    .from("detalle_orden")
-    .update({ enviado_cocina: true })
-    .eq("orden_id", orden.id)
-    .eq("enviado_cocina", false)
-    .select("id,producto_nombre,cantidad,notas,consumidor");
+    // 2. Buscamos qué platillos faltan por enviar a la cocina
+    const { data: pendientes, error: errPendientes } = await supabase
+      .from("detalle_orden")
+      .select("*")
+      .eq("orden_id", orden.id)
+      .eq("enviado_cocina", false);
 
-  if (updErr) throw new Error(updErr.message);
-  if (!enviadosAhora || enviadosAhora.length === 0) return { ok: false, error: "NO_HAY_PENDIENTES" };
+    if (errPendientes) throw errPendientes;
+    if (!pendientes || pendientes.length === 0) {
+      return { ok: false, error: "NO_HAY_PENDIENTES" };
+    }
 
-  await recalcAndUpdateOrderTotal(orden.id);
-  const clienteActualizado = await bumpVisitasIfNewDay(telefono);
+    // 3. Los marcamos como "enviados" en la base de datos
+    const { error: errUpdate } = await supabase
+      .from("detalle_orden")
+      .update({ enviado_cocina: true })
+      .eq("orden_id", orden.id)
+      .eq("enviado_cocina", false);
 
-  await supabase.from("kds_events").insert({ orden_id: orden.id, items_count: enviadosAhora.length });
+    if (errUpdate) throw errUpdate;
 
-  const nombreCliente = cliente?.nombre ? String(cliente.nombre).trim() : "Anónimo";
-  const lines = enviadosAhora.map((it) => {
-    const cons = it.consumidor && it.consumidor !== "General" ? ` (${it.consumidor})` : "";
-    const nota = it.notas ? `\n   Nota: ${it.notas}` : "";
-    return `${it.cantidad}x ${it.producto_nombre}${cons}${nota}`;
-  });
+    // --- FUNCIÓN RECUPERADA: Actualizar fecha de última compra ---
+    try {
+      await supabase
+        .from("clientes")
+        .update({ ultimo_mensaje: new Date().toISOString() })
+        .eq("telefono", telefono);
+    } catch (errDb) {
+      console.error("No se pudo actualizar ultimo_mensaje:", errDb);
+    }
+    // -------------------------------------------------------------
 
-  const kdsText =
-    `🔥 NUEVA COMANDA — MESA ${orden.numero_mesa}\n` +
-    `Cliente: ${nombreCliente}\n` +
-    `—\n${lines.join("\n")}\n` +
-    `Hora: ${nowHHMM()}`;
+    // 4. Armamos el ticket (el mensaje que le llegará al staff/cocina)
+    let ticket = `🛎️ NUEVA ORDEN - MESA ${orden.numero_mesa}\n`;
+    ticket += `Cliente: ${telefono}\n\n`;
+    
+    for (const item of pendientes) {
+      const cons = item.consumidor && item.consumidor !== "General" ? ` (${item.consumidor})` : "";
+      ticket += `[${item.cantidad}x] ${item.producto_nombre}${cons}\n`;
+      if (item.notas) ticket += `   📝 Nota: ${item.notas}\n`;
+    }
 
-  return {
-    ok: true,
-    orden_id: orden.id,
-    numero_mesa: orden.numero_mesa,
-    kds: { to: KDS_PHONE || null, text: kdsText },
-    cliente: clienteActualizado || cliente || null
-  };
+    // 5. Devolvemos el ticket para que index.js lo mande al KDS_PHONE
+    return {
+      ok: true,
+      kds: {
+        to: process.env.KDS_PHONE, 
+        text: ticket.trim()
+      }
+    };
+    
+  } catch (error) {
+    console.error("Error en confirmar_comanda_cocina:", error);
+    return { ok: false, error: error.message };
+  }
 }
-
 async function ver_cuenta_detallada(telefono, modo = "total") {
   telefono = normalizePhone(telefono);
   assertNonEmpty(telefono, "telefono");
@@ -548,7 +594,74 @@ async function saveChatMessage(telefono, direction, text, wa_message_id = null) 
   const { error } = await supabase.from("chat_messages").insert({ telefono, direction, text: text || null, wa_message_id: wa_message_id || null });
   if (error) console.warn("[chat_messages insert]", error.message);
 }
+// --- NUEVO: Cierra la cuenta automáticamente después del timer ---
+async function cerrarCuentaFinal(telefono) {
+  try {
+    const orden = await getLatestOrderByPhone(telefono, ["abierta", "pendiente_pago"]);
+    if (orden) {
+      await supabase
+        .from("ordenes")
+        .update({ estado: "cerrada" })
+        .eq("id", orden.id);
+      console.log(`✅ Cuenta de ${telefono} (Mesa ${orden.numero_mesa}) cerrada automáticamente.`);
+    }
+  } catch (error) {
+    console.error("❌ Error cerrando la cuenta final:", error);
+  }
+}
+// --- NUEVO: Sistema VIP de Despedida y Cashback ---
+async function procesarDespedidaVip(telefono) {
+  try {
+    const orden = await getLatestOrderByPhone(telefono, ["abierta", "pendiente_pago"]);
+    if (!orden) return null;
 
+    const gastado = orden.total || 0;
+    const puntosGanados = Math.floor(gastado * 0.05); // 5% de cashback
+
+    // Buscar al cliente para sumar sus puntos
+    const { data: cliente } = await supabase.from("clientes").select("nombre, puntos, visitas").eq("telefono", telefono).maybeSingle();
+    const nuevosPuntos = (cliente?.puntos || 0) + puntosGanados;
+
+    // Guardar los nuevos puntos en la base de datos
+    if (cliente) {
+      await supabase.from("clientes").update({ puntos: nuevosPuntos }).eq("telefono", telefono);
+    }
+
+    // Cerramos la cuenta automáticamente usando la función que ya hicimos
+    await cerrarCuentaFinal(telefono);
+
+    return {
+      nombre: cliente?.nombre || "VIP",
+      visitas: cliente?.visitas || 1,
+      gastado: gastado,
+      ganados: puntosGanados,
+      totalPuntos: nuevosPuntos,
+      mesa: orden.numero_mesa
+    };
+  } catch (err) {
+    console.error("Error en VIP:", err);
+    return null;
+  }
+}
+// --- NUEVO: Borrar todos los items no enviados (Cancelar orden) ---
+async function cancelar_orden_completa(telefono) {
+  try {
+    const orden = await getLatestOrderByPhone(telefono, ["abierta", "pendiente_pago"]);
+    if (!orden) return { ok: false, error: "NO_ORDER" };
+
+    const { error } = await supabase
+      .from("detalle_orden") // Usando tu tabla correcta
+      .delete()
+      .eq("orden_id", orden.id)
+      .eq("enviado_cocina", false);
+
+    if (error) throw error;
+    return { ok: true, message: "Todos los items pendientes fueron eliminados." };
+  } catch (err) {
+    console.error("Error cancelar_orden_completa:", err);
+    return { ok: false, error: err.message };
+  }
+}
 module.exports = {
   supabase,
   ADMIN_PHONE,
@@ -562,6 +675,8 @@ module.exports = {
   asegurar_orden_abierta,
   previsualizar_pedido,
   cancelar_item_sin_enviar,
+  cancelar_orden_completa,
+
   confirmar_comanda_cocina,
   ver_cuenta_detallada,
   iniciar_pago,
@@ -569,8 +684,10 @@ module.exports = {
   registro_wifi,
   llamar_mesero,
   como_va_mi_pedido,
+  cerrarCuentaFinal,
   solicitar_factura,
   guardar_rating,
+  procesarDespedidaVip,
 
   getMenuCategories,
   getFaqsList,

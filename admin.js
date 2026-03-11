@@ -61,6 +61,26 @@ async function setFaq(id, title, body, orden=null){
   const { error } = await supabase.from("faqs").upsert(payload, { onConflict: "id" });
   if (error) throw new Error(error.message);
   return { ok:true };
+  // --- NUEVAS FUNCIONES PARA BORRAR ---
+async function deletePromo(dow) {
+  const d = Number(dow);
+  if (!Number.isInteger(d) || d < 0 || d > 6) return { ok: false, error: "DOW_INVALIDO" };
+  const { error } = await supabase.from("promos").delete().eq("dow", d);
+  if (error) throw new Error(error.message);
+  return { ok: true };
+}
+
+async function deleteFaq(id) {
+  const { error } = await supabase.from("faqs").delete().eq("id", String(id).trim());
+  if (error) throw new Error(error.message);
+  return { ok: true };
+}
+
+async function deleteProductoMenu(nombre) {
+  const { error } = await supabase.from("menu").delete().eq("nombre", String(nombre).trim());
+  if (error) throw new Error(error.message);
+  return { ok: true };
+}
 }
 
 // Menu admin determinista
@@ -180,6 +200,17 @@ async function handleAdminText(text){
       if (!r.ok) return "❌ Formato: Agregar producto <Nombre> <Precio> <Categoria>";
       return `✅ Producto agregado: ${m[1]} ($${Number(m[2]).toFixed(2)}) / ${m[4]}`;
     }
+    {
+    const m = t.match(/^borrar\s+producto\s+(.+)$/i);
+    if (m) {
+      try {
+        await deleteProductoMenu(m[1]);
+        return `✅ Producto eliminado por completo: ${m[1]}`;
+      } catch (err) {
+        return `❌ No se pudo borrar (Posiblemente ya tiene ventas históricas ligadas). Te recomiendo usar mejor: ${m[1]} agotado`;
+      }
+    }
+  }
   }
 
   // Links
@@ -202,6 +233,13 @@ async function handleAdminText(text){
       if (!r.ok) return "❌ DOW inválido (0=Dom..6=Sab).";
       return `✅ Promo actualizada para dow=${m[1]}`;
     }
+    {
+    const m = t.match(/^promo\s+delete\s+(\d)$/i);
+    if (m) {
+      await deletePromo(m[1]);
+      return `✅ Promo borrada (día ${m[1]})`;
+    }
+  }
   }
   if (/^promo\s+list$/i.test(t)) {
     const rows = await listPromos();
@@ -221,6 +259,13 @@ async function handleAdminText(text){
       if (!r.ok) return "❌ Formato: faq set <id> | <titulo> | <cuerpo> | <orden(opcional)>";
       return `✅ FAQ actualizada: ${id}`;
     }
+    {
+    const m = t.match(/^faq\s+delete\s+([a-z0-9_]+)$/i);
+    if (m) {
+      await deleteFaq(m[1]);
+      return `✅ FAQ borrada del sistema: ${m[1]}`;
+    }
+  }
   }
 
   // Chat humano: comando para que el bot envíe al cliente (tu WhatsApp admin escribe esto)
@@ -228,18 +273,44 @@ async function handleAdminText(text){
     const m = t.match(/^enviar\s+a\s+(\d{10,15})\s*:\s*(.+)$/i);
     if (m) return JSON.stringify({ __action: "SEND_TO_CLIENT", to: m[1], text: m[2] });
   }
-
-  if (/^(admin\s+help|ayuda\s+admin|help)$/i.test(t)) {
+// --- NUEVO: Comando Anti-Caos (Cerrar mesa) ---
+  const matchCerrar = t.match(/^cerrar\s+mesa\s+(\d+)$/i);
+  if (matchCerrar) {
+    const numMesa = parseInt(matchCerrar[1]);
+    const { error } = await supabase
+      .from("ordenes")
+      .update({ estado: "cerrada" })
+      .eq("numero_mesa", numMesa)
+      .in("estado", ["abierta", "pendiente_pago"]);
+    
+    if (error) return `❌ Error al cerrar la mesa ${numMesa}: ${error.message}`;
+    return `✅ ¡Listo Jefe! La mesa ${numMesa} ha sido CERRADA y liberada exitosamente.`;
+  }
+  // --- NUEVO: Comando Liberar (Salir del Chat Humano) ---
+  const matchLiberar = t.match(/^liberar\s+([0-9]+)$/i);
+  if (matchLiberar) {
+    const phoneToRelease = matchLiberar[1];
+    // Devolvemos una instrucción secreta en JSON para que index.js haga el trabajo
+    return JSON.stringify({
+      __action: "RELEASE_CLIENT",
+      to: phoneToRelease
+    });
+  }
+if (/^(admin\s+help|ayuda\s+admin|help)$/i.test(t)) {
     return (
       "🛠️ Admin comandos:\n" +
       "KPIs: Ventas hoy | Ventas semana | Ventas mes | Clientes hoy | Ticket promedio hoy | Producto más vendido hoy | Producto menos vendido hoy\n\n" +
       "Menú:\n" +
-      "• <Producto> agotado\n• <Producto> disponible\n• Cambiar precio <Producto> a <Precio>\n• Agregar producto <Nombre> <Precio> <Categoria>\n\n" +
+      "• <Producto> agotado\n• <Producto> disponible\n• Cambiar precio <Producto> a <Precio>\n• Agregar producto <Nombre> <Precio> <Categoria>\n• Borrar producto <Nombre>\n\n" +
+      "Mesas y Clientes:\n" +
+      "• Cerrar mesa <numero>\n\n" +
       "Links:\n" +
-      "• Ver links\n• Set link <key> <url>\n(keys: menu_visual_url, payment_link, google_review_url, privacy_url, terms_url)\n\n" +
-      "Promos:\n• Promo list\n• Promo set <0-6> | <texto>\n\n" +
-      "FAQs:\n• FAQ list\n• FAQ set <id> | <titulo> | <cuerpo> | <orden(opcional)>\n\n" +
-      "Chat humano:\n• Enviar a <telefono>: <mensaje>"
+      "• Ver links\n• Set link <key> <url>\n\n" +
+      "Promos:\n• Promo list\n• Promo set <0-6> | <texto>\n• Promo delete <0-6>\n\n" +
+      "FAQs:\n• FAQ list\n• FAQ set <id> | <titulo> | <cuerpo> | <orden>\n• FAQ delete <id>\n\n" +
+      "Chat humano:\n" +
+      "• Enviar a <telefono>: <mensaje>\n" +
+      "• Liberar <telefono>"
     );
   }
 
