@@ -16,7 +16,8 @@ const WHATSAPP_PHONE_NUMBER_ID = process.env.WHATSAPP_PHONE_NUMBER_ID;
 const WHATSAPP_VERIFY_TOKEN = process.env.WHATSAPP_VERIFY_TOKEN;
 const WHATSAPP_API_VERSION = process.env.WHATSAPP_API_VERSION || "v20.0";
 
-const ADMIN_PHONE = process.env.ADMIN_PHONE || "5212225687851";
+// --- NUEVO MULTI-ADMIN ---
+const ADMIN_PHONES = (process.env.ADMIN_PHONES || process.env.ADMIN_PHONE || "5212225687851").split(",").map(s => s.trim());
 const ADMIN_CONSOLE_TOKEN = process.env.ADMIN_CONSOLE_TOKEN || "";
 const DEBUG_WEBHOOK = process.env.DEBUG_WEBHOOK === "1";
 
@@ -27,6 +28,7 @@ console.log("✅ Boot");
 console.log("ENV CHECK SUPABASE_URL =", process.env.SUPABASE_URL);
 console.log("ENV CHECK SUPABASE_KEY present =", !!process.env.SUPABASE_KEY);
 console.log("ENV CHECK WHATSAPP_PHONE_NUMBER_ID present =", !!WHATSAPP_PHONE_NUMBER_ID);
+console.log("ADMINISTRADORES REGISTRADOS:", ADMIN_PHONES);
 
 // -------------------- Clients --------------------
 const openai = new OpenAI({ apiKey: OPENAI_API_KEY });
@@ -59,6 +61,16 @@ async function sendText(to, text, opts = {}) {
     try { await tools.saveChatMessage(to, "out", text, null); } catch {}
   }
 }
+
+// --- FUNCIÓN PARA AVISAR A TODOS LOS ADMINS ---
+async function notifyAdmins(text) {
+  for (const admin of ADMIN_PHONES) {
+    if (admin) {
+      try { await sendText(admin, text, { skipSave: true }); } catch (e) {}
+    }
+  }
+}
+
 async function sendImage(to, imageUrl, caption) {
   const url = waMessagesUrl();
   const payload = { messaging_product: "whatsapp", to, type: "image", image: { link: imageUrl, caption } };
@@ -164,13 +176,6 @@ async function sendGoMenu(to, bodyText = "¿Qué hacemos ahora?", extraButtons =
   await sendButtons(to, bodyText, merged);
 }
 
-async function sendStartScreen(to) {
-  await sendButtons(to, "¡Hola! 👋 ¿Qué prefieres?", [
-    { id: "start_human", title: "🧑‍💼 Hablar humano" }, 
-    { id: "start_app", title: "🍽️ Iniciar pedido" }, 
-  ]);
-}
-
 // -------------------- P0: Sesiones persistentes --------------------
 const sessionCache = new Map(); // telefono -> {session, loadedAt}
 const SESSION_CACHE_TTL_MS = 30 * 60 * 1000;
@@ -257,30 +262,24 @@ async function maybeFireTimers(to, s) {
 }
 function setFollowUp15(s) { s.timers.followUpAt = Date.now() + 15 * 60 * 1000; }
 function setGoodbye5(s, from) {
-  // Limpiar el timer viejo si existe, sin dejar referencias circulares
   if (s._paymentTimerId) {
     clearTimeout(s._paymentTimerId);
     s._paymentTimerId = null;
   }
 
-  // Crear el nuevo timer
   s._paymentTimerId = setTimeout(async () => {
     try {
-      // 1. Cerramos la cuenta real en la base de datos
       await tools.cerrarCuentaFinal(from); 
-
-      // 2. Nos despedimos y limpiamos
       await sendText(from, "¡Gracias por visitar La Casita Del Choripan! Fue un honor atenderte hoy, te esperamos pronto. 🏠");
       await sendButtons(from, "¿Necesitas algo más?", [{ id: "go_menu", title: "🔙 Menú Principal" }]);
-      
-      // Reiniciar la sesión de forma segura
       const freshSession = defaultSession();
       await saveSession(from, freshSession);
     } catch (err) {
       console.error("Error en el timer de despedida:", err);
     }
-  }, 300000); // 5 minutos (300,000 ms)
+  }, 300000); 
 }
+
 // -------------------- Determinismo básico --------------------
 function isGreeting(text) {
   const t = String(text || "").trim().toLowerCase();
@@ -295,14 +294,10 @@ function tryParseMesa(text) {
 }
 function extractMesaNumber(text) {
   const raw = String(text || "").trim().toLowerCase();
-
   if (/^\d+$/.test(raw)) return Number(raw);
-
   const m = raw.match(/mesa\s*(\d+)/i);
   if (m) return Number(m[1]);
-
   if (raw.includes("llevar")) return 99;
-
   return null;
 }
 
@@ -314,17 +309,11 @@ async function sendNativeCatalogFlow(to, s) {
   const catalogId = process.env.WHATSAPP_CATALOG_ID;
 
   if (!catalogId) {
-    // Fallback elegante
-    await sendText(
-      to,
-      "No encontré el catálogo nativo configurado. Te mostraré el menú alterno."
-    );
+    await sendText(to, "No encontré el catálogo nativo configurado. Te mostraré el menú alterno.");
     if (typeof sendMenuCategories === "function") {
       await sendMenuCategories(to);
     } else {
-      await sendGoMenu(to, "Elige una opción del menú para continuar.", [
-        { id: "btn_ver_menu", title: "📋 Mostrar menú" }
-      ]);
+      await sendGoMenu(to, "Elige una opción del menú para continuar.", [{ id: "btn_ver_menu", title: "📋 Mostrar menú" }]);
     }
     return;
   }
@@ -337,35 +326,21 @@ async function sendNativeCatalogFlow(to, s) {
     type: "interactive",
     interactive: {
       type: "catalog_message",
-      body: {
-        text: "Agrega tus productos al carrito nativo de WhatsApp y envíamelo por aquí."
-      },
-      action: {
-        name: "catalog_message"
-      }
+      body: { text: "Agrega tus productos al carrito nativo de WhatsApp y envíamelo por aquí." },
+      action: { name: "catalog_message" }
     }
   };
 
   try {
     await axiosClient.post(url, payload, { headers: waHeaders() });
-    await sendText(
-      to,
-      "Cuando termines tu carrito, envíamelo y te mostraré el resumen para confirmarlo."
-    );
+    await sendText(to, "Cuando termines tu carrito, envíamelo y te mostraré el resumen para confirmarlo.");
   } catch (err) {
     console.error("❌ Error enviando catálogo nativo:", err.response?.data || err.message);
-
-    await sendText(
-      to,
-      "No pude abrir el catálogo nativo. Te mostraré el menú alterno."
-    );
-
+    await sendText(to, "No pude abrir el catálogo nativo. Te mostraré el menú alterno.");
     if (typeof sendMenuCategories === "function") {
       await sendMenuCategories(to);
     } else {
-      await sendGoMenu(to, "Elige una opción del menú para continuar.", [
-        { id: "btn_ver_menu", title: "📋 Mostrar menú" }
-      ]);
+      await sendGoMenu(to, "Elige una opción del menú para continuar.", [{ id: "btn_ver_menu", title: "📋 Mostrar menú" }]);
     }
   }
 }
@@ -380,38 +355,22 @@ async function askOrderMode(to, s) {
 }
 
 async function processPendingCart(from, s) {
-  if (!Array.isArray(s.carrito_pendiente) || s.carrito_pendiente.length === 0) {
-    return false;
-  }
-
-  if (!s.mesa) {
-    return false;
-  }
+  if (!Array.isArray(s.carrito_pendiente) || s.carrito_pendiente.length === 0) return false;
+  if (!s.mesa) return false;
 
   let itemsParaMandar = [];
 
-  // Caso ideal: tools ya tiene mapper por retailer_id
   if (typeof tools.mapRetailerIdsToMenuItems === "function") {
-  const { resolved, missing } = await tools.mapRetailerIdsToMenuItems(s.carrito_pendiente);
-
-  if ((!resolved || resolved.length === 0) && missing?.length) {
-    await sendText(
-      from,
-      `❌ No pude identificar estos productos del catálogo:\n- ${missing.join("\n- ")}`
-    );
-    return true;
-  }
-
-  itemsParaMandar = resolved || [];
-
-  if (missing?.length) {
-    await sendText(
-      from,
-      `⚠️ No pude identificar algunos productos del catálogo y no los agregué:\n- ${missing.join("\n- ")}`
-    );
-  }
-} else {
-    // Fallback temporal: seguir usando retailer_id como nombre
+    const { resolved, missing } = await tools.mapRetailerIdsToMenuItems(s.carrito_pendiente);
+    if ((!resolved || resolved.length === 0) && missing?.length) {
+      await sendText(from, `❌ No pude identificar estos productos del catálogo:\n- ${missing.join("\n- ")}`);
+      return true;
+    }
+    itemsParaMandar = resolved || [];
+    if (missing?.length) {
+      await sendText(from, `⚠️ No pude identificar algunos productos del catálogo y no los agregué:\n- ${missing.join("\n- ")}`);
+    }
+  } else {
     itemsParaMandar = s.carrito_pendiente.map((p) => ({
       producto_nombre: normalizeCatalogId(p.product_retailer_id),
       cantidad: Number(p.quantity || 1),
@@ -423,27 +382,22 @@ async function processPendingCart(from, s) {
   const preview = await tools.previsualizar_pedido(from, s.mesa, itemsParaMandar);
 
   if (preview?.ok) {
-  s.last_preview = {
-    orden_id: preview.orden_id,
-    total_pendiente: preview.total_pendiente,
-    ts: Date.now()
-  };
-  s.state = "ORDER_PREVIEW";
-  s.carrito_pendiente = null;
-
-  await sendPreview(from, preview);
-  return true;
-}
+    s.last_preview = {
+      orden_id: preview.orden_id,
+      total_pendiente: preview.total_pendiente,
+      ts: Date.now()
+    };
+    s.state = "ORDER_PREVIEW";
+    s.carrito_pendiente = null;
+    await sendPreview(from, preview);
+    return true;
+  }
 
   if (preview?.error === "PRODUCTOS_NO_DISPONIBLES") {
     let msg = `❌ No pude mapear algunos productos del carrito:\n- ${preview.missing.join("\n- ")}`;
-
     if (preview.alternativas?.length) {
-      msg += `\n\nOpciones parecidas:\n${preview.alternativas
-        .map((a) => `• ${a.nombre}`)
-        .join("\n")}`;
+      msg += `\n\nOpciones parecidas:\n${preview.alternativas.map((a) => `• ${a.nombre}`).join("\n")}`;
     }
-
     await sendText(from, msg);
     return true;
   }
@@ -451,6 +405,7 @@ async function processPendingCart(from, s) {
   await sendText(from, "No pude procesar tu carrito. Inténtalo nuevamente.");
   return true;
 }
+
 // -------------------- Menú por categorías --------------------
 async function sendMenuCategories(to) {
   const cats = await tools.getMenuCategories();
@@ -459,7 +414,6 @@ async function sendMenuCategories(to) {
     await sendGoMenu(to);
     return;
   }
-
   const url = waMessagesUrl();
   const rows = cats.slice(0, 9).map((c) => ({ id: `menu_cat:${c}`, title: c }));
   const payload = {
@@ -472,7 +426,6 @@ async function sendMenuCategories(to) {
       action: { button: "Ver categorías", sections: [{ title: "Categorías", rows }] },
     },
   };
-
   await axiosClient.post(url, payload, { headers: waHeaders() });
   try { await tools.saveChatMessage(to, "out", "Menú categorías", null); } catch {}
 }
@@ -485,13 +438,10 @@ async function sendMenuByCategory(to, categoria) {
     await sendGoMenu(to);
     return;
   }
-
   let txt = `📖 ${categoria}:\n`;
   for (const it of items) txt += `• ${it.nombre} — $${Number(it.precio).toFixed(2)}\n`;
-
   const menuVisual = await tools.get_config("menu_visual_url", "https://is.gd/j0142M");
   txt += `\n📲 Menú visual: ${menuVisual}`;
-
   await sendText(to, txt.trim());
   await sendGoMenu(to);
 }
@@ -504,13 +454,11 @@ async function sendFaqsList(to) {
     await sendGoMenu(to);
     return;
   }
-
   const url = waMessagesUrl();
   const rows = list.slice(0, 9).map((f) => ({
-  id: `faq:${f.id}`,
-  title: String(f.title || "").slice(0, 24)
-})); 
-
+    id: `faq:${f.id}`,
+    title: String(f.title || "").slice(0, 24)
+  })); 
   const payload = {
     messaging_product: "whatsapp",
     to,
@@ -521,7 +469,6 @@ async function sendFaqsList(to) {
       action: { button: "Ver FAQs", sections: [{ title: "Temas", rows }] },
     },
   };
-
   await axiosClient.post(url, payload, { headers: waHeaders() });
   try { await tools.saveChatMessage(to, "out", "FAQs list", null); } catch {}
 }
@@ -617,7 +564,6 @@ async function runToolCalling(messages) {
       }
       continue;
     }
-
     messages.push(msg);
     return messages;
   }
@@ -669,24 +615,22 @@ async function showMainMenu(to, s, greetingText = null) {
   s.state = "MAIN_MENU";
 }
 
-
 async function askMesa(to, s) {
   s.state = "ASK_MESA";
   await sendText(to, "¿En qué mesa estás? (Ej: ‘Mesa 4’)");
   await sendGoMenu(to, "Cuando gustes, dime: Mesa 4");
 }
+
 async function goOrderingFlow(from, s) {
   if (!s.mesa) {
     s.state = "ASK_MESA";
     await sendText(from, "Primero necesito tu mesa. Ejemplo: 'Mesa 4' o solo '4'.");
     return;
   }
-
   if (!s.split_mode) {
     await askOrderMode(from, s);
     return;
   }
-
   s.state = "ORDERING";
   await sendText(from, "Perfecto. Agrega productos al carrito y envíamelo para sumarlos a tu cuenta actual.");
   await sendNativeCatalogFlow(from, s);
@@ -700,43 +644,19 @@ function adminConsoleAuth(req, res, next) {
 }
 
 async function renderConsoleHome() {
-  const { data, error } = await tools.supabase
-    .from("bot_sessions")
-    .select("telefono, updated_at")
-    .order("updated_at", { ascending: false })
-    .limit(50);
-
+  const { data, error } = await tools.supabase.from("bot_sessions").select("telefono, updated_at").order("updated_at", { ascending: false }).limit(50);
   if (error) return `<h3>Error</h3><pre>${error.message}</pre>`;
-
-  const rows = (data || [])
-    .map((r) => `<li><a href="/console/chat?tel=${r.telefono}">${r.telefono}</a> <small>${r.updated_at}</small></li>`)
-    .join("");
-
-  return `
-    <h2>LCDc Bot Console</h2>
-    <p>Chats recientes:</p>
-    <ul>${rows || "<li>Sin sesiones</li>"}</ul>
-  `;
+  const rows = (data || []).map((r) => `<li><a href="/console/chat?tel=${r.telefono}">${r.telefono}</a> <small>${r.updated_at}</small></li>`).join("");
+  return `<h2>LCDc Bot Console</h2><p>Chats recientes:</p><ul>${rows || "<li>Sin sesiones</li>"}</ul>`;
 }
 
 async function renderConsoleChat(tel) {
-  const { data, error } = await tools.supabase
-    .from("chat_messages")
-    .select("direction,text,created_at")
-    .eq("telefono", tel)
-    .order("created_at", { ascending: false })
-    .limit(80);
-
+  const { data, error } = await tools.supabase.from("chat_messages").select("direction,text,created_at").eq("telefono", tel).order("created_at", { ascending: false }).limit(80);
   if (error) return `<h3>Error</h3><pre>${error.message}</pre>`;
-
-  const msgs = (data || [])
-    .reverse()
-    .map((m) => {
-      const who = m.direction === "in" ? "Cliente" : "Bot/Staff";
-      return `<div style="margin:6px 0;"><b>${who}</b> <small>${m.created_at}</small><br/>${(m.text || "").replace(/</g, "&lt;")}</div>`;
-    })
-    .join("");
-
+  const msgs = (data || []).reverse().map((m) => {
+    const who = m.direction === "in" ? "Cliente" : "Bot/Staff";
+    return `<div style="margin:6px 0;"><b>${who}</b> <small>${m.created_at}</small><br/>${(m.text || "").replace(/</g, "&lt;")}</div>`;
+  }).join("");
   return `
     <h2>Chat: ${tel}</h2>
     <div style="padding:10px;border:1px solid #ddd;border-radius:8px;max-width:900px;">${msgs || "Sin mensajes"}</div>
@@ -759,10 +679,7 @@ app.get("/", (_req, res) => res.json({ ok: true }));
 app.get("/health", (_req, res) => res.json({ ok: true }));
 
 // Consola
-app.get("/console", adminConsoleAuth, async (_req, res) => {
-  const html = await renderConsoleHome();
-  res.send(html);
-});
+app.get("/console", adminConsoleAuth, async (_req, res) => { const html = await renderConsoleHome(); res.send(html); });
 app.get("/console/chat", adminConsoleAuth, async (req, res) => {
   const tel = String(req.query.tel || "");
   if (!tel) return res.status(400).send("Falta tel");
@@ -785,34 +702,24 @@ app.get("/webhook", (req, res) => {
   return res.sendStatus(403);
 });
 
-// Webhook messages (UNICO)
-// Webhook messages (UNICO)
-// Webhook messages (UNICO)
-// Webhook messages (UNICO)
+// Webhook messages 
 app.post("/webhook", async (req, res) => {
   try {
     if (DEBUG_WEBHOOK) console.dir(req.body, { depth: null });
-
     const entry = req.body?.entry?.[0];
     const change = entry?.changes?.[0];
     const value = change?.value;
     const message = value?.messages?.[0];
 
     if (!message) return res.sendStatus(200);
-  
 
     const from = message.from;
     const messageId = message.id || null;
-  
     const text = message?.text?.body || null;
     const listId = message?.interactive?.list_reply?.id || null;
     const buttonId = message?.interactive?.button_reply?.id || null;
-    // --- NUEVO: Detectar el carrito del catálogo ---
     const orderItems = message?.order?.product_items || null;
 
-    console.log("INBOUND:", { from, messageId, type: message.type, text, listId, buttonId, hasOrder: !!orderItems });
-
-    // Dedupe WA
     if (messageId) {
       const { error: insErr } = await tools.supabase.from("wa_inbox").insert({ message_id: messageId, telefono: from });
       if (insErr) {
@@ -820,17 +727,13 @@ app.post("/webhook", async (req, res) => {
         if (msg.includes("duplicate") || msg.includes("already exists")) return res.sendStatus(200);
       }
     }
-
-    // log inbound
     try {
       const logText = orderItems ? "[CARRITO_CATALOGO]" : (text || `[interactive:${listId || buttonId}]`);
       await tools.saveChatMessage(from, "in", logText, messageId);
     } catch {}
 
-    // responder rápido a Meta
     res.sendStatus(200);
 
-    // procesar async pasando orderItems
     setImmediate(() => {
       handleIncoming(from, { text, listId, buttonId, orderItems })
         .catch((e) => console.error("handleIncoming Error:", e?.message || e));
@@ -841,10 +744,13 @@ app.post("/webhook", async (req, res) => {
     if (!res.headersSent) res.sendStatus(200);
   }
 }); 
+
+// ============================================================================
+// ==================== FUNCION PRINCIPAL DE MANEJO DE MENSAJES =================
+// ============================================================================
 async function handleIncoming(from, input) {
-const s = await loadSession(from);
-const previousLastActivity = Number(s.lastActivity || 0);
-touch(s);
+  const s = await loadSession(from);
+  touch(s);
 
   if (!checkRateLimit(s)) {
     await sendText(from, "⚠️ Estoy recibiendo muchos mensajes. Dame 10 segundos.");
@@ -854,71 +760,58 @@ touch(s);
 
   await maybeFireTimers(from, s);
 
-  // Extraemos las variables incluyendo orderItems
   let text = input.text || null;
   const listId = input.listId || null;
   const buttonId = input.buttonId || null;
   const actionId = listId || buttonId || null;
   const orderItems = input.orderItems || null;
 
-  // --- NUEVO: Procesamiento DIRECTO del Carrito (Bypass a la IA) ---
+  // --- Bypass del Carrito ---
   if (orderItems) {
-  s.state = "ORDERING";
+    s.state = "ORDERING";
+    const normalizedCart = orderItems.map((p) => ({
+      product_retailer_id: normalizeCatalogId(p.product_retailer_id),
+      quantity: Number(p.quantity || 1)
+    }));
 
-  const normalizedCart = orderItems.map((p) => ({
-    product_retailer_id: normalizeCatalogId(p.product_retailer_id),
-    quantity: Number(p.quantity || 1)
-  }));
-
-  if (!s.mesa) {
-    s.carrito_pendiente = normalizedCart;
-    s.state = "ASK_MESA";
-    await sendText(
-      from,
-      "Recibí tu carrito ✅\n\nAntes de procesarlo necesito tu mesa. Ejemplo: 'Mesa 4' o solo '4'."
-    );
-    await saveSession(from, s);
-    return;
-  }
-
-  if (!s.split_mode) {
-    s.carrito_pendiente = normalizedCart;
-    await askOrderMode(from, s);
-    await saveSession(from, s);
-    return;
-  }
-
-  s.carrito_pendiente = normalizedCart;
-  await processPendingCart(from, s);
-  await saveSession(from, s);
-  return;
-}
-  // ------------------------------------------------------------------
-
-  // ADMIN determinista
-  if (from === ADMIN_PHONE) {
-    if (!text) { 
-      await sendText(from, "Admin: envía comandos por texto. Escribe: admin help"); 
-      return; 
+    if (!s.mesa) {
+      s.carrito_pendiente = normalizedCart;
+      s.state = "ASK_MESA";
+      await sendText(from, "Recibí tu carrito ✅\n\nAntes de procesarlo necesito tu mesa. Ejemplo: 'Mesa 4' o solo '4'.");
+      await saveSession(from, s);
+      return;
     }
+
+    if (!s.split_mode) {
+      s.carrito_pendiente = normalizedCart;
+      await askOrderMode(from, s);
+      await saveSession(from, s);
+      return;
+    }
+
+    s.carrito_pendiente = normalizedCart;
+    await processPendingCart(from, s);
+    await saveSession(from, s);
+    return;
+  }
+
+  // --- ADMIN determinista (AHORA MULTI-ADMIN) ---
+  if (ADMIN_PHONES.includes(from)) {
+    if (!text) { await sendText(from, "Admin: envía comandos por texto. Escribe: admin help"); return; }
     const reply = await handleAdminText(text);
-    
-    // Acción enviar a cliente (si el admin handler devuelve JSON)
     if (reply && reply.startsWith("{")) {
       try {
         const obj = JSON.parse(reply);
-        
         if (obj.__action === "SEND_TO_CLIENT" && obj.to && obj.text) {
           await sendText(obj.to, `🧑‍💼 Soporte: ${obj.text}`);
           await sendText(from, `✅ Enviado a ${obj.to}`);
           return;
         }
-
         if (obj.__action === "RELEASE_CLIENT" && obj.to) {
           sessionCache.delete(obj.to);
           await sendText(obj.to, "🤖 Nuestro equipo ha finalizado el chat. ¡Beto está de vuelta para ayudarte!");
           await sendGoMenu(obj.to);
-          await sendText(from, `✅ El cliente ${obj.to} ha sido liberado. El bot vuelve a tomar el control.`);
+          await sendText(from, `✅ El cliente ${obj.to} ha sido liberado.`);
           return;
         }
       } catch {}
@@ -927,25 +820,19 @@ touch(s);
     return;
   }
 
-  // --- NUEVO ONBOARDING PREMIUM (Con sistema de intentos) ---
+  // --- ONBOARDING PREMIUM ---
   if (s.state === "NEW" || (text && isGreeting(text) && !["ASK_NAME_1", "ASK_NAME_2", "ORDERING"].includes(s.state))) {
-    
-    // Investigamos si el cliente ya existe
     let cliente = null;
     try { cliente = (await tools.identificar_cliente(from, null)).cliente; } catch {}
-
     const yaTieneNombre = cliente && cliente.nombre && String(cliente.nombre).trim() !== "";
 
     if (yaTieneNombre) {
-      // RAMA B: Cliente Registrado
       s.nombre_cliente = cliente.nombre;
       let msg = `Hola ${cliente.nombre}, qué gusto verte de nuevo. 🏠\n\n`;
-      
       if (cliente.puntos && Number(cliente.puntos) > 0) {
         msg += `💎 Te recuerdo que cuentas con $${cliente.puntos} pesitos a tu favor para tu próxima compra.\n\n`;
       }
       msg += `Comencemos. ¿Qué deseas hacer hoy?`;
-      
       await sendButtons(from, msg, [
         { id: "btn_assign_table", title: "🪑 Asignar Mesa" },
         { id: "btn_info_casita", title: "ℹ️ La Casita Info" }
@@ -954,8 +841,7 @@ touch(s);
       await saveSession(from, s);
       return;
     } else {
-      // RAMA A: Cliente Nuevo
-      let msg = `¡Hola! Soy Beto 🤖, bienvenido a La Casita Del Choripán y estoy aquí para ayudarte.\n\nPuedo mostrarte el menú, tomarte la orden, agregar cosas cuando estés comiendo, llamar al mesero, darte info del Wi-Fi y mucho más.\n\nPara empezar, ¿cuál es tu nombre?`;
+      let msg = `¡Hola! Soy Beto 🤖, bienvenido a La Casita Del Choripán y estoy aquí para ayudarte.\n\nPuedo mostrarte el menú, tomarte la orden, llamar al mesero, darte info del Wi-Fi y mucho más.\n\nPara empezar, ¿cuál es tu nombre?`;
       await sendText(from, msg);
       s.state = "ASK_NAME_1";
       s.name_attempts = 1;
@@ -964,13 +850,12 @@ touch(s);
     }
   }
 
-  // Lógica de 2 Intentos para el Nombre
+  // Lógica Intentos Nombre
   if ((s.state === "ASK_NAME_1" || s.state === "ASK_NAME_2") && text) {
     if (text.trim().length >= 2 && text.trim().length <= 40) {
       const name = text.trim();
       s.nombre_cliente = name;
       await tools.identificar_cliente(from, name); 
-      
       await sendButtons(from, `Hola ${name}, nos da gusto conocerte. ¡Comencemos!\n\n¿Qué deseas hacer hoy?`, [
         { id: "btn_assign_table", title: "🪑 Asignar Mesa" },
         { id: "btn_info_casita", title: "ℹ️ La Casita Info" }
@@ -979,7 +864,6 @@ touch(s);
       await saveSession(from, s);
       return;
     }
-    
     if (s.name_attempts === 1) {
       s.name_attempts = 2;
       s.state = "ASK_NAME_2";
@@ -987,7 +871,6 @@ touch(s);
       await saveSession(from, s);
       return;
     }
-    
     await sendText(from, "Está bien, no te preocupes. Continuemos como invitado.");
     await sendButtons(from, "¿Qué deseas hacer hoy?", [
       { id: "btn_assign_table", title: "🪑 Asignar Mesa" },
@@ -997,23 +880,25 @@ touch(s);
     await saveSession(from, s);
     return;
   }
-  // --- FIN DEL ONBOARDING PREMIUM ---
 
-  // Modo humano: forward al admin
+  // Modo Humano
   if (s.state === "HUMAN_CHAT" && s.human_mode) {
     if (actionId === "go_menu") { await showMainMenu(from, s); await saveSession(from, s); return; }
     if (text) {
-      await sendText(ADMIN_PHONE, `📩 Cliente ${from}: ${text}`);
+      await notifyAdmins(`📩 Cliente ${from}: ${text}`);
       await sendText(from, "✅ Recibido. En breve te responden.");
       await saveSession(from, s);
       return;
     }
   }
 
-  // go_menu global
+
+  // =========================================================================
+  // ==================== MANEJADORES DE TODOS LOS BOTONES ===================
+  // =========================================================================
+
   if (actionId === "go_menu") { await showMainMenu(from, s); await saveSession(from, s); return; }
 
-  // --- MANEJADORES DE LOS NUEVOS BOTONES (ONBOARDING) ---
   if (actionId === "btn_info_casita") {
     const sections = [{
       title: "Explora La Casita",
@@ -1047,66 +932,48 @@ touch(s);
     return;
   }
 
-if (actionId && actionId.startsWith("set_mesa_")) {
-  const mesaNum = parseInt(actionId.replace("set_mesa_", ""), 10);
+  if (actionId && actionId.startsWith("set_mesa_")) {
+    const mesaNum = parseInt(actionId.replace("set_mesa_", ""), 10);
+    s.mesa = mesaNum; 
+    s.state = "TABLE_ASSIGNED";
+    await tools.asegurar_orden_abierta(from, mesaNum);
+    const textoMesa = mesaNum === 99 ? "Para Llevar" : `Mesa ${mesaNum}`;
+    await sendText(from, `✅ Listo, te registré en ${textoMesa}.`);
+    await askOrderMode(from, s);
+    await saveSession(from, s);
+    return;
+  }
 
-  s.mesa = mesaNum;
-  s.state = "TABLE_ASSIGNED";
-
-  await tools.asegurar_orden_abierta(from, mesaNum);
-
-  const textoMesa = mesaNum === 99 ? "Para Llevar" : `Mesa ${mesaNum}`;
-  await sendText(from, `✅ Listo, te registré en ${textoMesa}.`);
-
-  await askOrderMode(from, s);
-
-  await saveSession(from, s);
-  return;
-}
-
-if (actionId === "start_ordering" || actionId === "btn_ordenar") {
-  await goOrderingFlow(from, s);
-  await saveSession(from, s);
-  return;
-}
+  if (actionId === "start_ordering" || actionId === "btn_ordenar") {
+    await goOrderingFlow(from, s);
+    await saveSession(from, s);
+    return;
+  }
 
   if (actionId === "btn_know_menu") {
     const linksString = await tools.get_config("menu_foto_url", "https://ipvdftmptwelqauaxcpw.supabase.co/storage/v1/object/public/Menu/Menu%20-%201.png,https://ipvdftmptwelqauaxcpw.supabase.co/storage/v1/object/public/Menu/Menu%20-%202.png"); 
     const links = linksString.split(",");
-
     for (let i = 0; i < links.length; i++) {
       const caption = (i === links.length - 1) ? "¡Aquí tienes nuestro menú completo! 🤤" : ""; 
       await sendImage(from, links[i].trim(), caption);
     }
-
     await sendButtons(from, "¿Listo para pedir?", [
       { id: "btn_assign_table", title: "🪑 Asignar Mesa / Pedir" },
       { id: "btn_humano", title: "🧑‍💼 Hablar con humano" }
     ]);
-    
     await saveSession(from, s);
     return;
   }
 
-  // Acciones menú principal
-if (actionId === "btn_ver_menu") {
-  await goOrderingFlow(from, s);
-  await saveSession(from, s);
-  return;
-}
-
-  if (actionId === "btn_promo") {
-    await sendText(from, await tools.getPromoText());
-    await sendGoMenu(from);
+  if (actionId === "btn_ver_menu") {
+    await goOrderingFlow(from, s);
     await saveSession(from, s);
     return;
   }
 
-if (actionId === "btn_faqs") {
-  await sendFaqsList(from);
-  await saveSession(from, s);
-  return;
-}  
+  if (actionId === "btn_promo") { await sendText(from, await tools.getPromoText()); await sendGoMenu(from); await saveSession(from, s); return; }
+  if (actionId === "btn_faqs") { await sendFaqsList(from); await saveSession(from, s); return; }
+  
   if (actionId && actionId.startsWith("faq:")) {
     const faqId = actionId.split("faq:")[1];
     const f = await tools.getFaqById(faqId);
@@ -1161,55 +1028,46 @@ if (actionId === "btn_faqs") {
     await saveSession(from, s);
     return;
   }
+
   if (actionId === "btn_status") {
-  const out = await tools.como_va_mi_pedido(from);
-
-  if (!out.ok) {
-    if (out.error === "NO_HAY_ORDEN") {
-      await sendText(from, "No encontré una orden activa en este momento.");
-    } else {
-      await sendText(from, "No pude consultar el estado de tu pedido en este momento.");
+    const out = await tools.como_va_mi_pedido(from);
+    if (!out.ok) {
+      if (out.error === "NO_HAY_ORDEN") { await sendText(from, "No encontré una orden activa en este momento."); } 
+      else { await sendText(from, "No pude consultar el estado de tu pedido en este momento."); }
+      await sendGoMenu(from);
+      await saveSession(from, s);
+      return;
     }
+    await sendText(from, out.text);
     await sendGoMenu(from);
     await saveSession(from, s);
     return;
   }
 
-  await sendText(from, out.text);
-  await sendGoMenu(from);
-  await saveSession(from, s);
-  return;
-}
-if (actionId === "btn_ver_cuenta") {
-  const modo = s.split_mode === "split" ? "split" : "total";
-  const out = await tools.ver_cuenta_detallada(from, modo);
-
-  if (!out.ok) {
-    if (out.error === "NO_HAY_ORDEN") {
-      await sendText(from, "No encontré una cuenta activa en este momento.");
-    } else {
-      await sendText(from, "No pude consultar tu cuenta en este momento.");
+  if (actionId === "btn_ver_cuenta") {
+    const modo = s.split_mode === "split" ? "split" : "total";
+    const out = await tools.ver_cuenta_detallada(from, modo);
+    if (!out.ok) {
+      if (out.error === "NO_HAY_ORDEN") { await sendText(from, "No encontré una cuenta activa en este momento."); } 
+      else { await sendText(from, "No pude consultar tu cuenta en este momento."); }
+      await sendGoMenu(from);
+      await saveSession(from, s);
+      return;
     }
-    await sendGoMenu(from);
+    await sendText(from, out.receiptText);
+    await sendButtons(from, "¿Qué deseas hacer ahora?", [
+      { id: "start_payment", title: "💳 Pagar" },
+      { id: "btn_ordenar", title: "➕ Agregar más" },
+      { id: "go_menu", title: "🔙 Menú Principal" }
+    ]);
     await saveSession(from, s);
     return;
   }
 
-  await sendText(from, out.receiptText);
-
-  await sendButtons(from, "¿Qué deseas hacer ahora?", [
-    { id: "start_payment", title: "💳 Pagar" },
-    { id: "btn_ordenar", title: "➕ Agregar más" },
-    { id: "go_menu", title: "🔙 Menú Principal" }
-  ]);
-
-  await saveSession(from, s);
-  return;
-}
   if (actionId === "btn_humano") {
     s.state = "HUMAN_CHAT";
     s.human_mode = true;
-    await sendText(ADMIN_PHONE, `🧑‍💼 Cliente prefiere atención humana\nTEL: ${from}\nResponde con: enviar a ${from}: <mensaje>\nO usa consola: /console`);
+    await notifyAdmins(`🧑‍💼 Cliente prefiere atención humana\nTEL: ${from}\nResponde con: enviar a ${from}: <mensaje>\nO usa consola: /console`);
     await sendText(from, "Listo. Ya avisé a un humano para que te atienda 🙌");
     await sendButtons(from, "¿Quieres volver al bot?", [
       { id: "go_menu", title: "🔙 Menú Principal" }
@@ -1218,80 +1076,53 @@ if (actionId === "btn_ver_cuenta") {
     return;
   }
 
-
-
-if (actionId === "order_one" || actionId === "order_split") {
-  s.split_mode = actionId === "order_split" ? "split" : "one";
-  s.state = "ORDERING";
-
-  await sendText(
-    from,
-    s.split_mode === "split"
-      ? "Perfecto. Vamos a dividir la cuenta."
-      : "Perfecto. Será una sola cuenta."
-  );
-
-  const resumed = await processPendingCart(from, s);
-
-  if (!resumed) {
-    await sendNativeCatalogFlow(from, s);
-  }
-
-  await saveSession(from, s);
-  return;
-}
-
-if (actionId === "fix_order") {
-  s.state = "ORDER_EDITING";
-  await sendText(
-    from,
-    "Perfecto. Dime qué quieres corregir.\n\nEjemplos:\n- quitar 1 choripán\n- agregar 2 refrescos\n- cambiar una coca por agua"
-  );
-  await saveSession(from, s);
-  return;
-}
-
-if (actionId === "confirm_kitchen") {
-  if (!s.last_preview?.orden_id) {
-    await sendText(from, "No encontré una previsualización activa para confirmar.");
+  if (actionId === "order_one" || actionId === "order_split") {
+    s.split_mode = actionId === "order_split" ? "split" : "one";
+    s.state = "ORDERING";
+    await sendText(from, s.split_mode === "split" ? "Perfecto. Vamos a dividir la cuenta." : "Perfecto. Será una sola cuenta.");
+    const resumed = await processPendingCart(from, s);
+    if (!resumed) { await sendNativeCatalogFlow(from, s); }
     await saveSession(from, s);
     return;
   }
 
-  const out = await tools.confirmar_comanda_cocina(from);
+  if (actionId === "fix_order") {
+    s.state = "ORDER_EDITING";
+    await sendText(from, "Perfecto. Dime qué quieres corregir.\n\nEjemplos:\n- quitar 1 choripán\n- agregar 2 refrescos\n- cambiar una coca por agua");
+    await saveSession(from, s);
+    return;
+  }
 
-  if (!out.ok) {
-    if (out.error === "NO_HAY_PENDIENTES") {
-      await sendText(from, "No tengo items pendientes por confirmar.");
-    } else if (out.error === "FALTA_MESA") {
-      await sendText(from, "Antes de enviar a cocina necesito tu mesa. Ejemplo: 'Mesa 4' o solo '4'.");
-      s.state = "ASK_MESA";
-    } else {
-      await sendText(from, "No pude enviar a cocina. Revisa tu orden e intenta de nuevo.");
+  if (actionId === "confirm_kitchen") {
+    if (!s.last_preview?.orden_id) {
+      await sendText(from, "No encontré una previsualización activa para confirmar.");
+      await saveSession(from, s);
+      return;
     }
+
+    const out = await tools.confirmar_comanda_cocina(from);
+    if (!out.ok) {
+      if (out.error === "NO_HAY_PENDIENTES") { await sendText(from, "No tengo items pendientes por confirmar."); } 
+      else if (out.error === "FALTA_MESA") { await sendText(from, "Antes de enviar a cocina necesito tu mesa. Ejemplo: 'Mesa 4' o solo '4'."); s.state = "ASK_MESA"; } 
+      else { await sendText(from, "No pude enviar a cocina. Revisa tu orden e intenta de nuevo."); }
+      await saveSession(from, s);
+      return;
+    }
+
+    if (out.kds?.to && out.kds?.text) { try { await sendText(out.kds.to, out.kds.text); } catch {} }
+
+    s.state = "ORDER_CONFIRMED";
+    s.last_confirmed_at = Date.now();
+    await sendText(from, "✅ Tu orden fue confirmada y enviada a cocina.");
+    setFollowUp15(s);
+    await sendButtons(from, "¿Deseas pedir algo más o revisar tu cuenta?", [
+      { id: "btn_ordenar", title: "➕ Agregar más" },
+      { id: "btn_ver_cuenta", title: "💳 Ver mi cuenta" },
+      { id: "go_menu", title: "🔙 Menú Principal" }
+    ]);
     await saveSession(from, s);
     return;
   }
-
-  if (out.kds?.to && out.kds?.text) {
-    try { await sendText(out.kds.to, out.kds.text); } catch {}
-  }
-
-  s.state = "ORDER_CONFIRMED";
-  s.last_confirmed_at = Date.now();
-
-  await sendText(from, "✅ Tu orden fue confirmada y enviada a cocina.");
-  setFollowUp15(s);
-
-  await sendButtons(from, "¿Deseas pedir algo más o revisar tu cuenta?", [
-    { id: "btn_ordenar", title: "➕ Agregar más" },
-    { id: "btn_ver_cuenta", title: "💳 Ver mi cuenta" },
-    { id: "go_menu", title: "🔙 Menú Principal" }
-  ]);
-
-  await saveSession(from, s);
-  return;
-}
 
   if (actionId === "start_payment") {
     const out = await tools.iniciar_pago(from);
@@ -1336,9 +1167,7 @@ if (actionId === "confirm_kitchen") {
     const vipData = await tools.procesarDespedidaVip(from);
     if (vipData && vipData.gastado > 0) {
       await sendText(from, `¡Gracias por tu visita, ${vipData.nombre}! 🌟\nHoy acumulaste $${vipData.ganados} pesitos.\nTienes un total de $${vipData.totalPuntos} para tu próxima compra.\n\n¡Te esperamos pronto! 🏠`);
-      if (process.env.ADMIN_PHONE) {
-        await sendText(process.env.ADMIN_PHONE, `🔔 ALERTA VIP: El cliente ${vipData.nombre} (Visita #${vipData.visitas}) se retiró de la Mesa ${vipData.mesa}.\nGastó: $${vipData.gastado}\nGanó: $${vipData.ganados} pts.`);
-      }
+      await notifyAdmins(`🔔 ALERTA VIP: El cliente ${vipData.nombre} (Visita #${vipData.visitas}) se retiró de la Mesa ${vipData.mesa}.\nGastó: $${vipData.gastado}\nGanó: $${vipData.ganados} pts.`);
     } else {
       await sendText(from, "¡Gracias por visitarnos! Fue un placer atenderte. Te esperamos pronto. 🏠");
       await tools.cerrarCuentaFinal(from);
@@ -1347,27 +1176,15 @@ if (actionId === "confirm_kitchen") {
     return;
   }
 
-  // Manejo de Estados de TEXTO Libre
+  // =========================================================================
+  // ========================= MANEJO DE TEXTO LIBRE =========================
+  // =========================================================================
+
   if (text) {
     const t = text.trim().toLowerCase();
-if (preview?.ok) {
-  s.last_preview = {
-    orden_id: preview.orden_id,
-    total_pendiente: preview.total_pendiente,
-    ts: Date.now()
-  };
-  s.state = "ORDER_PREVIEW";
-  s.carrito_pendiente = null;
 
-  await sendPreview(from, preview);
-  return true;
-}
     // Atajos Globales de Emergencia
-    if (t === "ordenar") {
-  await goOrderingFlow(from, s);
-  await saveSession(from, s);
-  return;
-}
+    if (t === "ordenar") { await goOrderingFlow(from, s); await saveSession(from, s); return; }
     if (t === "menu" || t === "menú" || t === "inicio") { await showMainMenu(from, s); await saveSession(from, s); return; }
     if (t.includes("salir") || t.includes("adiós") || t.includes("adios")) {
       await sendText(from, "¡Gracias por visitarnos! 👋 Te esperamos pronto. 🏠");
@@ -1377,7 +1194,7 @@ if (preview?.ok) {
     if (t.includes("humano") || t.includes("soporte") || t.includes("ayuda")) {
       s.state = "HUMAN_CHAT";
       s.human_mode = true;
-      await sendText(ADMIN_PHONE, `🧑‍💼 Cliente solicita atención humana\nTEL: ${from}`);
+      await notifyAdmins(`🧑‍💼 Cliente solicita atención humana\nTEL: ${from}`);
       await sendText(from, "Listo. Ya avisé a un humano para que te atienda 🙌");
       await sendButtons(from, "¿Quieres volver al bot?", [{ id: "go_menu", title: "🔙 Menú Principal" }]);
       await saveSession(from, s);
@@ -1393,27 +1210,17 @@ if (preview?.ok) {
 
     // Estados Específicos
     if (s.state === "ASK_MESA") {
-  const mesa = extractMesaNumber(text);
-
-  if (!mesa) {
-    await sendText(from, "No pude entender la mesa. Ejemplo: 'Mesa 4' o solo '4'.");
-    await saveSession(from, s);
-    return;
-  }
-
-  s.mesa = mesa;
-  s.state = "TABLE_ASSIGNED";
-
-  await tools.asegurar_orden_abierta(from, mesa);
-
-  const textoMesa = mesa === 99 ? "Para Llevar" : `Mesa ${mesa}`;
-  await sendText(from, `✅ Listo, te registré en ${textoMesa}.`);
-
-  await askOrderMode(from, s);
-
-  await saveSession(from, s);
-  return;
-}
+      const mesa = extractMesaNumber(text);
+      if (!mesa) { await sendText(from, "No pude entender la mesa. Ejemplo: 'Mesa 4' o solo '4'."); await saveSession(from, s); return; }
+      s.mesa = mesa;
+      s.state = "TABLE_ASSIGNED";
+      await tools.asegurar_orden_abierta(from, mesa);
+      const textoMesa = mesa === 99 ? "Para Llevar" : `Mesa ${mesa}`;
+      await sendText(from, `✅ Listo, te registré en ${textoMesa}.`);
+      await askOrderMode(from, s);
+      await saveSession(from, s);
+      return;
+    }
 
     if (s.state === "WIFI_COLLECT") {
       const m = text.split(",").map((x) => x.trim());
@@ -1468,8 +1275,8 @@ if (preview?.ok) {
       return;
     }
 
-    // ORDERING IA (Toma de pedidos por texto)
-    if (s.state === "ORDERING") {
+    // --- ORDERING IA ---
+    if (s.state === "ORDERING" || s.state === "ORDER_EDITING") {
       if (!s.mesa) { await askMesa(from, s); await saveSession(from, s); return; }
 
       const system = `
@@ -1484,10 +1291,10 @@ REGLAS DE PEDIDOS Y NOTAS (¡CRÍTICO!):
 2. Si el cliente agrega INSTRUCCIONES ESPECIALES (ej: "sin chimichurri", "extra queso"), DEBES guardarlo en el campo 'notas'.
 3. Si el cliente pide QUITAR o CANCELAR un platillo específico, usa 'cancelar_item_sin_enviar'.
 
-REGLAS DE VENTAS:
+REGLAS DE VENTAS Y UPSELLING:
 1. Si pide "un choripan", asume cantidad 1.
 2. Si pide "papa", pregúntale qué tipo: Clásicas, Gajo o Especiales.
-3. UPSELLING SECRETO: Sugiere CASUALMENTE acompañarlo con bebida o modificador extra. No leas la lista entera, sugiere 1 o 2.
+3. REGLA DE ORO PARA EL UPSELLING: Si el cliente pide algo, TIENES QUE EJECUTAR la herramienta 'previsualizar_pedido' INMEDIATAMENTE para guardarlo en ese mismo turno. NUNCA hagas una sugerencia sin haber ejecutado la herramienta primero.
 `.trim();
 
       const messages = [{ role: "system", content: system }, ...s.history, { role: "user", content: text }];
@@ -1510,18 +1317,13 @@ REGLAS DE VENTAS:
           await saveSession(from, s);
           return;
         }
-       if (lastPreview.ok === true) {
-  s.last_preview = {
-    orden_id: lastPreview.orden_id,
-    total_pendiente: lastPreview.total_pendiente,
-    ts: Date.now()
-  };
-  s.state = "ORDER_PREVIEW";
-
-  await sendPreview(from, lastPreview);
-  await saveSession(from, s);
-  return;
-}
+        if (lastPreview.ok === true) {
+          s.last_preview = { orden_id: lastPreview.orden_id, total_pendiente: lastPreview.total_pendiente, ts: Date.now() };
+          s.state = "ORDER_PREVIEW";
+          await sendPreview(from, lastPreview);
+          await saveSession(from, s);
+          return;
+        }
       }
 
       const lastCancel = getLastToolOutput(newMsgs, "cancelar_item_sin_enviar");
@@ -1544,7 +1346,7 @@ REGLAS DE VENTAS:
       return;
     }
 
-    // Clasificador Inteligente de Intenciones (IA Atrapa-todo)
+    // --- Clasificador de Intenciones (Atrapa-Todo) ---
     const promptIntencion = `
 El cliente acaba de decir: "${text}"
 Clasifica su intención respondiendo ÚNICAMENTE con una palabra:
@@ -1583,13 +1385,14 @@ OTRO (cualquier otra cosa)
       }
     } catch (err) { console.error("Error clasificador:", err); }
 
-    // Fallback por defecto si ninguna intención hace match y no está en un estado específico
+    // Fallback por defecto
     await showMainMenu(from, s);
     await saveSession(from, s);
     return;
+
   } // <-- Fin del if (text)
 
-  // Si envían una imagen o audio fuera de los flujos soportados
+  // Si envían una imagen o audio fuera de los flujos
   await sendText(from, "Aún no puedo procesar ese tipo de mensaje. Por favor usa los botones o texto.");
   await sendGoMenu(from);
   await saveSession(from, s);
