@@ -180,7 +180,9 @@ function defaultSession() {
     history: [],
     state: "NEW",
     mesa: null,
-    split_mode: "one",
+    split_mode: null,
+    carrito_pendiente: null,
+    last_preview: null,
     name_attempts: 0,
     human_mode: false,
     timers: { followUpAt: null, goodbyeAt: null },
@@ -291,7 +293,164 @@ function tryParseMesa(text) {
   if (!Number.isInteger(n) || n <= 0) return null;
   return n;
 }
+function extractMesaNumber(text) {
+  const raw = String(text || "").trim().toLowerCase();
 
+  if (/^\d+$/.test(raw)) return Number(raw);
+
+  const m = raw.match(/mesa\s*(\d+)/i);
+  if (m) return Number(m[1]);
+
+  if (raw.includes("llevar")) return 99;
+
+  return null;
+}
+
+function normalizeCatalogId(v) {
+  return String(v || "").trim();
+}
+
+async function sendNativeCatalogFlow(to, s) {
+  const catalogId = process.env.WHATSAPP_CATALOG_ID;
+
+  if (!catalogId) {
+    // Fallback elegante
+    await sendText(
+      to,
+      "No encontré el catálogo nativo configurado. Te mostraré el menú alterno."
+    );
+    if (typeof sendMenuCategories === "function") {
+      await sendMenuCategories(to);
+    } else {
+      await sendGoMenu(to, "Elige una opción del menú para continuar.", [
+        { id: "btn_ver_menu", title: "📋 Mostrar menú" }
+      ]);
+    }
+    return;
+  }
+
+  const url = waMessagesUrl();
+  const payload = {
+    messaging_product: "whatsapp",
+    recipient_type: "individual",
+    to,
+    type: "interactive",
+    interactive: {
+      type: "catalog_message",
+      body: {
+        text: "Agrega tus productos al carrito nativo de WhatsApp y envíamelo por aquí."
+      },
+      action: {
+        name: "catalog_message"
+      }
+    }
+  };
+
+  try {
+    await axiosClient.post(url, payload, { headers: waHeaders() });
+    await sendText(
+      to,
+      "Cuando termines tu carrito, envíamelo y te mostraré el resumen para confirmarlo."
+    );
+  } catch (err) {
+    console.error("❌ Error enviando catálogo nativo:", err.response?.data || err.message);
+
+    await sendText(
+      to,
+      "No pude abrir el catálogo nativo. Te mostraré el menú alterno."
+    );
+
+    if (typeof sendMenuCategories === "function") {
+      await sendMenuCategories(to);
+    } else {
+      await sendGoMenu(to, "Elige una opción del menú para continuar.", [
+        { id: "btn_ver_menu", title: "📋 Mostrar menú" }
+      ]);
+    }
+  }
+}
+
+async function askOrderMode(to, s) {
+  s.state = "ORDER_MODE";
+  await sendButtons(to, "¿Cómo quieres manejar la cuenta?", [
+    { id: "order_one", title: "🧾 Una sola" },
+    { id: "order_split", title: "👥 Dividir" },
+    { id: "go_menu", title: "🔙 Menú Principal" },
+  ]);
+}
+
+async function processPendingCart(from, s) {
+  if (!Array.isArray(s.carrito_pendiente) || s.carrito_pendiente.length === 0) {
+    return false;
+  }
+
+  if (!s.mesa) {
+    return false;
+  }
+
+  let itemsParaMandar = [];
+
+  // Caso ideal: tools ya tiene mapper por retailer_id
+  if (typeof tools.mapRetailerIdsToMenuItems === "function") {
+  const { resolved, missing } = await tools.mapRetailerIdsToMenuItems(s.carrito_pendiente);
+
+  if ((!resolved || resolved.length === 0) && missing?.length) {
+    await sendText(
+      from,
+      `❌ No pude identificar estos productos del catálogo:\n- ${missing.join("\n- ")}`
+    );
+    return true;
+  }
+
+  itemsParaMandar = resolved || [];
+
+  if (missing?.length) {
+    await sendText(
+      from,
+      `⚠️ No pude identificar algunos productos del catálogo y no los agregué:\n- ${missing.join("\n- ")}`
+    );
+  }
+} else {
+    // Fallback temporal: seguir usando retailer_id como nombre
+    itemsParaMandar = s.carrito_pendiente.map((p) => ({
+      producto_nombre: normalizeCatalogId(p.product_retailer_id),
+      cantidad: Number(p.quantity || 1),
+      consumidor: "General",
+      notas: null
+    }));
+  }
+
+  const preview = await tools.previsualizar_pedido(from, s.mesa, itemsParaMandar);
+
+  if (preview?.ok) {
+  s.last_preview = {
+    orden_id: preview.orden_id,
+    total_pendiente: preview.total_pendiente,
+    ts: Date.now()
+  };
+  s.state = "ORDER_PREVIEW";
+  s.carrito_pendiente = null;
+
+  await sendPreview(from, preview);
+  return true;
+}
+
+  if (preview?.error === "PRODUCTOS_NO_DISPONIBLES") {
+    let msg = `❌ No pude mapear algunos productos del carrito:\n- ${preview.missing.join("\n- ")}`;
+
+    if (preview.alternativas?.length) {
+      msg += `\n\nOpciones parecidas:\n${preview.alternativas
+        .map((a) => `• ${a.nombre}`)
+        .join("\n")}`;
+    }
+
+    await sendText(from, msg);
+    return true;
+  }
+
+  await sendText(from, "No pude procesar tu carrito. Inténtalo nuevamente.");
+  return true;
+}
 // -------------------- Menú por categorías --------------------
 async function sendMenuCategories(to) {
   const cats = await tools.getMenuCategories();
@@ -347,7 +506,11 @@ async function sendFaqsList(to) {
   }
 
   const url = waMessagesUrl();
-  const rows = list.slice(0, 9).map((f) => ({ id: `faq:${f.id}`, title: f.title }));
+  const rows = list.slice(0, 9).map((f) => ({
+  id: `faq:${f.id}`,
+  title: String(f.title || "").slice(0, 24)
+})); 
+
   const payload = {
     messaging_product: "whatsapp",
     to,
@@ -437,7 +600,7 @@ async function executeTool(name, args) {
 async function runToolCalling(messages) {
   for (let i = 0; i < 4; i++) {
     const resp = await openai.chat.completions.create({
-      model: "gpt-4.1-mini",
+      model: "gpt-4o-mini",
       messages,
       tools: toolDefs,
       tool_choice: "auto",
@@ -506,19 +669,27 @@ async function showMainMenu(to, s, greetingText = null) {
   s.state = "MAIN_MENU";
 }
 
-async function askOrderMode(to, s) {
-  s.state = "ORDER_MODE";
-  await sendButtons(to, "¿Cómo quieres tu orden?", [
-    { id: "order_one", title: "🧾 Una sola cuenta" },
-    { id: "order_split", title: "➗ Dividir cuenta" },
-    { id: "go_menu", title: "🔙 Menú Principal" },
-  ]);
-}
 
 async function askMesa(to, s) {
   s.state = "ASK_MESA";
   await sendText(to, "¿En qué mesa estás? (Ej: ‘Mesa 4’)");
   await sendGoMenu(to, "Cuando gustes, dime: Mesa 4");
+}
+async function goOrderingFlow(from, s) {
+  if (!s.mesa) {
+    s.state = "ASK_MESA";
+    await sendText(from, "Primero necesito tu mesa. Ejemplo: 'Mesa 4' o solo '4'.");
+    return;
+  }
+
+  if (!s.split_mode) {
+    await askOrderMode(from, s);
+    return;
+  }
+
+  s.state = "ORDERING";
+  await sendText(from, "Perfecto. Agrega productos al carrito y envíamelo para sumarlos a tu cuenta actual.");
+  await sendNativeCatalogFlow(from, s);
 }
 
 // -------------------- Consola web mínima --------------------
@@ -671,8 +842,9 @@ app.post("/webhook", async (req, res) => {
   }
 }); 
 async function handleIncoming(from, input) {
-  const s = await loadSession(from);
-  touch(s);
+const s = await loadSession(from);
+const previousLastActivity = Number(s.lastActivity || 0);
+touch(s);
 
   if (!checkRateLimit(s)) {
     await sendText(from, "⚠️ Estoy recibiendo muchos mensajes. Dame 10 segundos.");
@@ -691,37 +863,36 @@ async function handleIncoming(from, input) {
 
   // --- NUEVO: Procesamiento DIRECTO del Carrito (Bypass a la IA) ---
   if (orderItems) {
-    s.state = "ORDERING";
-    
-    // Si no tiene mesa, guardamos el array de items crudo
-    if (!s.mesa) { 
-      s.carrito_pendiente = orderItems; 
-      await askMesa(from, s); 
-      await saveSession(from, s); 
-      return; 
-    }
-    
-    // Si ya tiene mesa, lo procesamos directo a la base de datos
-    const itemsParaMandar = orderItems.map(p => ({
-      producto_nombre: p.product_retailer_id,
-      cantidad: p.quantity
-    }));
-    
-    const preview = await tools.previsualizar_pedido(from, s.mesa, itemsParaMandar);
-    
-    if (preview.ok) {
-      await sendPreview(from, preview);
-    } else if (preview.error === "PRODUCTOS_NO_DISPONIBLES") {
-      let msg = `❌ No disponibles / no encontrados:\n- ${preview.missing.join("\n- ")}\n`;
-      if (preview.alternativas?.length) {
-        msg += `\n✅ Alternativas:\n` + preview.alternativas.slice(0, 6).map(a => `• ${a.nombre}`).join("\n");
-      }
-      await sendText(from, msg.trim());
-      await sendGoMenu(from);
-    }
+  s.state = "ORDERING";
+
+  const normalizedCart = orderItems.map((p) => ({
+    product_retailer_id: normalizeCatalogId(p.product_retailer_id),
+    quantity: Number(p.quantity || 1)
+  }));
+
+  if (!s.mesa) {
+    s.carrito_pendiente = normalizedCart;
+    s.state = "ASK_MESA";
+    await sendText(
+      from,
+      "Recibí tu carrito ✅\n\nAntes de procesarlo necesito tu mesa. Ejemplo: 'Mesa 4' o solo '4'."
+    );
     await saveSession(from, s);
-    return; // SALIMOS PARA QUE LA IA NO SE CONFUNDA
+    return;
   }
+
+  if (!s.split_mode) {
+    s.carrito_pendiente = normalizedCart;
+    await askOrderMode(from, s);
+    await saveSession(from, s);
+    return;
+  }
+
+  s.carrito_pendiente = normalizedCart;
+  await processPendingCart(from, s);
+  await saveSession(from, s);
+  return;
+}
   // ------------------------------------------------------------------
 
   // ADMIN determinista
@@ -876,26 +1047,28 @@ async function handleIncoming(from, input) {
     return;
   }
 
-  if (actionId && actionId.startsWith("set_mesa_")) {
-    const mesaNum = parseInt(actionId.replace("set_mesa_", ""));
-    s.mesa = mesaNum; 
-    await tools.asegurar_orden_abierta(from, mesaNum);
-    
-    const textoMesa = mesaNum === 99 ? "Para Llevar" : `Mesa ${mesaNum}`;
-    await sendButtons(from, `✅ Listo, registrado en ${textoMesa}.\n\n¿Qué prefieres hacer ahora?`, [
-      { id: "start_ordering", title: "📝 Pedir Orden" },
-      { id: "btn_humano", title: "🧑‍💼 Hablar con Humano" }
-    ]);
-    await saveSession(from, s);
-    return;
-  }
+if (actionId && actionId.startsWith("set_mesa_")) {
+  const mesaNum = parseInt(actionId.replace("set_mesa_", ""), 10);
 
-  if (actionId === "start_ordering") {
-    s.state = "ORDERING";
-    await sendText(from, "¡Excelente! Escribe tu pedido aquí abajo (ej: '2 choripanes sin chimichurri y 1 refresco') o envíame los platillos desde el Catálogo usando el botón 🛒.");
-    await saveSession(from, s);
-    return;
-  }
+  s.mesa = mesaNum;
+  s.state = "TABLE_ASSIGNED";
+
+  await tools.asegurar_orden_abierta(from, mesaNum);
+
+  const textoMesa = mesaNum === 99 ? "Para Llevar" : `Mesa ${mesaNum}`;
+  await sendText(from, `✅ Listo, te registré en ${textoMesa}.`);
+
+  await askOrderMode(from, s);
+
+  await saveSession(from, s);
+  return;
+}
+
+if (actionId === "start_ordering" || actionId === "btn_ordenar") {
+  await goOrderingFlow(from, s);
+  await saveSession(from, s);
+  return;
+}
 
   if (actionId === "btn_know_menu") {
     const linksString = await tools.get_config("menu_foto_url", "https://ipvdftmptwelqauaxcpw.supabase.co/storage/v1/object/public/Menu/Menu%20-%201.png,https://ipvdftmptwelqauaxcpw.supabase.co/storage/v1/object/public/Menu/Menu%20-%202.png"); 
@@ -916,40 +1089,11 @@ async function handleIncoming(from, input) {
   }
 
   // Acciones menú principal
-  if (actionId === "btn_ver_menu") {
-    const catalogId = process.env.WHATSAPP_CATALOG_ID;
-    if (!catalogId) {
-      await sendMenuCategories(from); 
-      await sendGoMenu(from, "Elige una categoría o vuelve al menú."); 
-      await saveSession(from, s); 
-      return;
-    }
-
-    const url = waMessagesUrl();
-    const payload = {
-      messaging_product: "whatsapp",
-      recipient_type: "individual",
-      to: from,
-      type: "interactive",
-      interactive: {
-        type: "catalog_message",
-        body: { text: "¡Echa un vistazo a nuestras delicias! 🌭🍟\nAgrega lo que gustes al carrito nativo y envíamelo por aquí." },
-        action: { name: "catalog_message" }
-      }
-    };
-
-    try {
-      await axiosClient.post(url, payload, { headers: waHeaders() });
-      await sendText(from, "💡 *Tip:* Cuando agregues todo a tu carrito de arriba, envíamelo y yo me encargaré del resto.");
-    } catch (err) {
-      console.error("❌ Error enviando catálogo:", err.response?.data || err.message);
-      await sendMenuCategories(from); 
-    }
-    
-    s.state = "MAIN_MENU";
-    await saveSession(from, s);
-    return;
-  }
+if (actionId === "btn_ver_menu") {
+  await goOrderingFlow(from, s);
+  await saveSession(from, s);
+  return;
+}
 
   if (actionId === "btn_promo") {
     await sendText(from, await tools.getPromoText());
@@ -958,8 +1102,11 @@ async function handleIncoming(from, input) {
     return;
   }
 
-  if (actionId === "btn_faqs") { await sendFaqsList(from); await sendGoMenu(from, "Selecciona un tema o vuelve al menú."); await saveSession(from, s); return; }
-  
+if (actionId === "btn_faqs") {
+  await sendFaqsList(from);
+  await saveSession(from, s);
+  return;
+}  
   if (actionId && actionId.startsWith("faq:")) {
     const faqId = actionId.split("faq:")[1];
     const f = await tools.getFaqById(faqId);
@@ -1014,7 +1161,51 @@ async function handleIncoming(from, input) {
     await saveSession(from, s);
     return;
   }
+  if (actionId === "btn_status") {
+  const out = await tools.como_va_mi_pedido(from);
 
+  if (!out.ok) {
+    if (out.error === "NO_HAY_ORDEN") {
+      await sendText(from, "No encontré una orden activa en este momento.");
+    } else {
+      await sendText(from, "No pude consultar el estado de tu pedido en este momento.");
+    }
+    await sendGoMenu(from);
+    await saveSession(from, s);
+    return;
+  }
+
+  await sendText(from, out.text);
+  await sendGoMenu(from);
+  await saveSession(from, s);
+  return;
+}
+if (actionId === "btn_ver_cuenta") {
+  const modo = s.split_mode === "split" ? "split" : "total";
+  const out = await tools.ver_cuenta_detallada(from, modo);
+
+  if (!out.ok) {
+    if (out.error === "NO_HAY_ORDEN") {
+      await sendText(from, "No encontré una cuenta activa en este momento.");
+    } else {
+      await sendText(from, "No pude consultar tu cuenta en este momento.");
+    }
+    await sendGoMenu(from);
+    await saveSession(from, s);
+    return;
+  }
+
+  await sendText(from, out.receiptText);
+
+  await sendButtons(from, "¿Qué deseas hacer ahora?", [
+    { id: "start_payment", title: "💳 Pagar" },
+    { id: "btn_ordenar", title: "➕ Agregar más" },
+    { id: "go_menu", title: "🔙 Menú Principal" }
+  ]);
+
+  await saveSession(from, s);
+  return;
+}
   if (actionId === "btn_humano") {
     s.state = "HUMAN_CHAT";
     s.human_mode = true;
@@ -1027,70 +1218,80 @@ async function handleIncoming(from, input) {
     return;
   }
 
-  if (actionId === "btn_ordenar") { await askOrderMode(from, s); await saveSession(from, s); return; }
 
-  if (actionId === "order_one") {
-    s.split_mode = "one";
-    s.state = "ORDERING";
-    if (!s.mesa) { await askMesa(from, s); await saveSession(from, s); return; }
-    await sendText(from, "Perfecto. Dime tu pedido (ej: '2 Choripán Clásico y 1 Agua Natural').");
-    await sendGoMenu(from);
+
+if (actionId === "order_one" || actionId === "order_split") {
+  s.split_mode = actionId === "order_split" ? "split" : "one";
+  s.state = "ORDERING";
+
+  await sendText(
+    from,
+    s.split_mode === "split"
+      ? "Perfecto. Vamos a dividir la cuenta."
+      : "Perfecto. Será una sola cuenta."
+  );
+
+  const resumed = await processPendingCart(from, s);
+
+  if (!resumed) {
+    await sendNativeCatalogFlow(from, s);
+  }
+
+  await saveSession(from, s);
+  return;
+}
+
+if (actionId === "fix_order") {
+  s.state = "ORDER_EDITING";
+  await sendText(
+    from,
+    "Perfecto. Dime qué quieres corregir.\n\nEjemplos:\n- quitar 1 choripán\n- agregar 2 refrescos\n- cambiar una coca por agua"
+  );
+  await saveSession(from, s);
+  return;
+}
+
+if (actionId === "confirm_kitchen") {
+  if (!s.last_preview?.orden_id) {
+    await sendText(from, "No encontré una previsualización activa para confirmar.");
     await saveSession(from, s);
     return;
   }
 
-  if (actionId === "order_split") {
-    s.split_mode = "split";
-    s.state = "ORDERING";
-    await sendText(from, "Perfecto. Para dividir por consumo, dime así: ‘Ana quiere X y Yo quiero Y…’. Yo lo guardaré por persona.");
-    if (!s.mesa) { await askMesa(from, s); await saveSession(from, s); return; }
-    await sendGoMenu(from, "Dime tu pedido cuando gustes.");
-    await saveSession(from, s);
-    return;
-  }
+  const out = await tools.confirmar_comanda_cocina(from);
 
-  if (actionId === "fix_order") {
-    s.state = "ORDERING";
-    await sendText(from, "Ok. Dime qué corregimos (puedes pedir más o decir 'quita X').");
-    await sendGoMenu(from);
-    await saveSession(from, s);
-    return;
-  }
-
-  if (actionId === "confirm_kitchen") {
-    const out = await tools.confirmar_comanda_cocina(from);
-    if (!out.ok) {
-      if (out.error === "NO_HAY_PENDIENTES") await sendText(from, "No tengo items pendientes por confirmar.");
-      else if (out.error === "FALTA_MESA") { await sendText(from, "Antes de enviar a cocina necesito tu mesa. (Ej: ‘Mesa 4’)"); s.state = "ASK_MESA"; }
-      else await sendText(from, "No pude enviar a cocina. Revisa tu orden e intenta de nuevo.");
-      await sendGoMenu(from);
-      await saveSession(from, s);
-      return;
-    }
-    if (out.kds?.to && out.kds?.text) { try { await sendText(out.kds.to, out.kds.text); } catch {} }
-    await sendText(from, "¡Listo! Ya lo mandé a cocina 👨‍🍳");
-    setFollowUp15(s);
-    await sendGoMenu(from);
-    await saveSession(from, s);
-    return;
-  }
-
-  if (actionId === "btn_ver_cuenta") {
-    const modo = s.split_mode === "split" ? "split" : "total";
-    const out = await tools.ver_cuenta_detallada(from, modo);
-    await sendText(from, out.ok ? out.receiptText : "Aún no tengo una orden activa.");
-    if (out.ok) {
-      await sendButtons(from, "¿Qué deseas hacer?", [
-        { id: "btn_ordenar", title: "🍕 Pedir más" },
-        { id: "start_payment", title: "💳 Cerrar y pagar" },
-        { id: "go_menu", title: "🔙 Menú Principal" },
-      ]);
+  if (!out.ok) {
+    if (out.error === "NO_HAY_PENDIENTES") {
+      await sendText(from, "No tengo items pendientes por confirmar.");
+    } else if (out.error === "FALTA_MESA") {
+      await sendText(from, "Antes de enviar a cocina necesito tu mesa. Ejemplo: 'Mesa 4' o solo '4'.");
+      s.state = "ASK_MESA";
     } else {
-      await sendGoMenu(from);
+      await sendText(from, "No pude enviar a cocina. Revisa tu orden e intenta de nuevo.");
     }
     await saveSession(from, s);
     return;
   }
+
+  if (out.kds?.to && out.kds?.text) {
+    try { await sendText(out.kds.to, out.kds.text); } catch {}
+  }
+
+  s.state = "ORDER_CONFIRMED";
+  s.last_confirmed_at = Date.now();
+
+  await sendText(from, "✅ Tu orden fue confirmada y enviada a cocina.");
+  setFollowUp15(s);
+
+  await sendButtons(from, "¿Deseas pedir algo más o revisar tu cuenta?", [
+    { id: "btn_ordenar", title: "➕ Agregar más" },
+    { id: "btn_ver_cuenta", title: "💳 Ver mi cuenta" },
+    { id: "go_menu", title: "🔙 Menú Principal" }
+  ]);
+
+  await saveSession(from, s);
+  return;
+}
 
   if (actionId === "start_payment") {
     const out = await tools.iniciar_pago(from);
@@ -1149,9 +1350,24 @@ async function handleIncoming(from, input) {
   // Manejo de Estados de TEXTO Libre
   if (text) {
     const t = text.trim().toLowerCase();
+if (preview?.ok) {
+  s.last_preview = {
+    orden_id: preview.orden_id,
+    total_pendiente: preview.total_pendiente,
+    ts: Date.now()
+  };
+  s.state = "ORDER_PREVIEW";
+  s.carrito_pendiente = null;
 
+  await sendPreview(from, preview);
+  return true;
+}
     // Atajos Globales de Emergencia
-    if (t === "ordenar") { await askOrderMode(from, s); await saveSession(from, s); return; }
+    if (t === "ordenar") {
+  await goOrderingFlow(from, s);
+  await saveSession(from, s);
+  return;
+}
     if (t === "menu" || t === "menú" || t === "inicio") { await showMainMenu(from, s); await saveSession(from, s); return; }
     if (t.includes("salir") || t.includes("adiós") || t.includes("adios")) {
       await sendText(from, "¡Gracias por visitarnos! 👋 Te esperamos pronto. 🏠");
@@ -1177,30 +1393,27 @@ async function handleIncoming(from, input) {
 
     // Estados Específicos
     if (s.state === "ASK_MESA") {
-      const mesa = tryParseMesa(text);
-      if (!mesa) { await sendText(from, "No pude entender la mesa. Ejemplo: ‘Mesa 4’"); await sendGoMenu(from); await saveSession(from, s); return; }
-      s.mesa = mesa;
-      await tools.asegurar_orden_abierta(from, mesa);
-      s.state = "ORDERING";
-      
-      if (s.carrito_pendiente) {
-        const itemsParaMandar = s.carrito_pendiente.map(p => ({
-          producto_nombre: p.product_retailer_id,
-          cantidad: p.quantity
-        }));
-        s.carrito_pendiente = null;
-        const preview = await tools.previsualizar_pedido(from, s.mesa, itemsParaMandar);
-        if (preview.ok) { await sendPreview(from, preview); } 
-        else { await sendText(from, "❌ Hubo un error procesando tu carrito. Por favor, dímelo por texto."); }
-        await saveSession(from, s);
-        return; 
-      }
-      
-      await sendText(from, "Perfecto. Ahora dime tu pedido (ej: '2 Choripán Clásico').");
-      await sendGoMenu(from);
-      await saveSession(from, s);
-      return;
-    }
+  const mesa = extractMesaNumber(text);
+
+  if (!mesa) {
+    await sendText(from, "No pude entender la mesa. Ejemplo: 'Mesa 4' o solo '4'.");
+    await saveSession(from, s);
+    return;
+  }
+
+  s.mesa = mesa;
+  s.state = "TABLE_ASSIGNED";
+
+  await tools.asegurar_orden_abierta(from, mesa);
+
+  const textoMesa = mesa === 99 ? "Para Llevar" : `Mesa ${mesa}`;
+  await sendText(from, `✅ Listo, te registré en ${textoMesa}.`);
+
+  await askOrderMode(from, s);
+
+  await saveSession(from, s);
+  return;
+}
 
     if (s.state === "WIFI_COLLECT") {
       const m = text.split(",").map((x) => x.trim());
@@ -1297,11 +1510,18 @@ REGLAS DE VENTAS:
           await saveSession(from, s);
           return;
         }
-        if (lastPreview.ok === true) {
-          await sendPreview(from, lastPreview);
-          await saveSession(from, s);
-          return;
-        }
+       if (lastPreview.ok === true) {
+  s.last_preview = {
+    orden_id: lastPreview.orden_id,
+    total_pendiente: lastPreview.total_pendiente,
+    ts: Date.now()
+  };
+  s.state = "ORDER_PREVIEW";
+
+  await sendPreview(from, lastPreview);
+  await saveSession(from, s);
+  return;
+}
       }
 
       const lastCancel = getLastToolOutput(newMsgs, "cancelar_item_sin_enviar");

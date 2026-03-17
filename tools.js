@@ -95,18 +95,24 @@ async function bumpVisitasIfNewDay(telefono) {
   const last = cliente.ultimo_mensaje ? new Date(cliente.ultimo_mensaje) : null;
   const shouldInc = !last || !sameDay(last, now);
 
- // const patch = { ultimo_mensaje: now.toISOString() };
- // if (shouldInc) patch.visitas = Number(cliente.visitas || 0) + 1;
+  const patch = { ultimo_mensaje: now.toISOString() };
+  if (shouldInc) patch.visitas = Number(cliente.visitas || 0) + 1;
 
-  const { data, error } = await supabase.from("clientes").update(patch).eq("telefono", telefono).select("*").maybeSingle();
+  const { data, error } = await supabase
+    .from("clientes")
+    .update(patch)
+    .eq("telefono", telefono)
+    .select("*")
+    .maybeSingle();
+
   if (error) throw new Error(error.message);
   return data || null;
 }
 
 async function consultar_menu(categoria_opcional) {
-  let q = supabase
-    .from("menu")
-    .select("id,nombre,descripcion,precio,categoria,disponible")
+ let q = supabase
+  .from("menu")
+  .select("id,nombre,descripcion,precio,categoria,disponible,wa_retailer_id,es_extra")
     .eq("disponible", true)
     .order("categoria", { ascending: true })
     .order("nombre", { ascending: true });
@@ -183,7 +189,51 @@ async function recalcAndUpdateOrderTotal(ordenId) {
 function quitarAcentos(str) {
   return String(str || "").normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase().trim();
 }
+async function mapRetailerIdsToMenuItems(orderItems) {
+  if (!Array.isArray(orderItems) || orderItems.length === 0) {
+    return { resolved: [], missing: [] };
+  }
 
+  const retailerIds = [...new Set(
+    orderItems.map((x) => String(x.product_retailer_id || "").trim()).filter(Boolean)
+  )];
+
+  if (!retailerIds.length) {
+    return { resolved: [], missing: [] };
+  }
+
+  const { data, error } = await supabase
+    .from("menu")
+    .select("id,nombre,precio,categoria,disponible,wa_retailer_id")
+    .in("wa_retailer_id", retailerIds)
+    .eq("disponible", true);
+
+  if (error) throw new Error(error.message);
+
+  const map = new Map((data || []).map((m) => [String(m.wa_retailer_id).trim(), m]));
+
+  const resolved = [];
+  const missing = [];
+
+  for (const it of orderItems) {
+    const key = String(it.product_retailer_id || "").trim();
+    const found = map.get(key);
+
+    if (!found) {
+      missing.push(key);
+      continue;
+    }
+
+    resolved.push({
+      producto_nombre: found.nombre,
+      cantidad: Number(it.quantity || 1),
+      consumidor: it.consumidor ? String(it.consumidor).trim() : "General",
+      notas: it.notas ? String(it.notas).trim() : null
+    });
+  }
+
+  return { resolved, missing };
+}
 async function previsualizar_pedido(telefono, numero_mesa, items) {
   telefono = normalizePhone(telefono);
   assertNonEmpty(telefono, "telefono");
@@ -203,50 +253,68 @@ async function previsualizar_pedido(telefono, numero_mesa, items) {
     return { producto_nombre, cantidad, notas, consumidor };
   });
 
-  const { data: menuAll, error: menuAllErr } = await supabase
-    .from("menu")
-    .select("nombre,precio,disponible,categoria")
-    .eq("disponible", true);
-  if (menuAllErr) throw new Error(menuAllErr.message);
+const { data: menuAll, error: menuAllErr } = await supabase
+  .from("menu")
+  .select("nombre,precio,disponible,categoria,es_extra")
+  .eq("disponible", true);
+if (menuAllErr) throw new Error(menuAllErr.message);
 
-  // --- NUEVO: Mapa de búsqueda sin acentos ---
-  const menuMapExact = new Map((menuAll || []).map((m) => [m.nombre, m]));
-  const menuMapFlexible = new Map((menuAll || []).map((m) => [quitarAcentos(m.nombre), m]));
+const menuMapExact = new Map((menuAll || []).map((m) => [String(m.nombre).trim(), m]));
+const menuMapFlexible = new Map((menuAll || []).map((m) => [quitarAcentos(m.nombre), m]));
 
-  for (const it of normalized) {
-    const searchName = quitarAcentos(it.producto_nombre);
-    if (menuMapFlexible.has(searchName)) {
-      // Si hace match sin acentos, forzamos el nombre EXACTO de la base de datos
-      it.producto_nombre = menuMapFlexible.get(searchName).nombre;
-    }
+for (const it of normalized) {
+  const searchName = quitarAcentos(it.producto_nombre);
+  if (menuMapFlexible.has(searchName)) {
+    it.producto_nombre = menuMapFlexible.get(searchName).nombre;
+  }
+}
+
+const nombres = [...new Set(normalized.map((x) => String(x.producto_nombre).trim()))];
+const missing = nombres.filter((n) => !menuMapExact.has(n));
+
+if (missing.length) {
+  const alternativas = (menuAll || [])
+    .filter((m) => m.es_extra !== true)
+    .filter((m) => !["Toppings", "Extras", "Add-ons", "Ingredientes"].includes(String(m.categoria || "").trim()))
+    .slice(0, 8)
+    .map((m) => ({
+      nombre: m.nombre,
+      categoria: m.categoria,
+      precio: m.precio
+    }));
+
+  return { ok: false, error: "PRODUCTOS_NO_DISPONIBLES", missing, alternativas };
+}
+const rowsToInsert = normalized.map((it, idx) => {
+  const keyExact = String(it.producto_nombre || "").trim();
+  const keyFlexible = quitarAcentos(it.producto_nombre || "");
+
+  const m = menuMapExact.get(keyExact) || menuMapFlexible.get(keyFlexible);
+
+  if (!m) {
+    throw new Error(`No pude resolver el precio del item #${idx + 1}: ${it.producto_nombre}`);
   }
 
-  const nombres = [...new Set(normalized.map((x) => x.producto_nombre))];
-  const missing = nombres.filter((n) => !menuMapExact.has(n));
-  
-  if (missing.length) {
-    const alternativas = (menuAll || []).slice(0, 8).map((m) => ({ nombre: m.nombre, categoria: m.categoria, precio: m.precio }));
-    return { ok: false, error: "PRODUCTOS_NO_DISPONIBLES", missing, alternativas };
-  }
+  const nombreFinal = String(m.nombre || "").trim();
+  const precio_unitario = Number(m.precio);
+  const subtotal = precio_unitario * it.cantidad;
 
-  const rowsToInsert = normalized.map((it) => {
-    const m = menuMapExact.get(it.producto_nombre);
-    const precio_unitario = Number(m.precio);
-    const subtotal = precio_unitario * it.cantidad;
-    return {
-      orden_id: orden.id,
-      producto_nombre: it.producto_nombre,
-      cantidad: it.cantidad,
-      precio_unitario,
-      subtotal,
-      notas: it.notas,
-      consumidor: it.consumidor,
-      enviado_cocina: false
-    };
-  });
+  return {
+    orden_id: orden.id,
+    producto_nombre: nombreFinal,
+    cantidad: it.cantidad,
+    precio_unitario,
+    subtotal,
+    notas: it.notas,
+    consumidor: it.consumidor,
+    enviado_cocina: false
+  };
+});
 
-  const { error: insErr } = await supabase.from("detalle_orden").insert(rowsToInsert);
-  if (insErr) throw new Error(insErr.message);
+// dedupe simple: si ya existe un pendiente idéntico, no lo reinserta
+const { error: insErr } = await supabase.from("detalle_orden").insert(rowsToInsert);
+if (insErr) throw new Error(insErr.message);
+
 
   const { data: pendientes, error: pendErr } = await supabase
     .from("detalle_orden")
@@ -267,7 +335,7 @@ async function cancelar_item_sin_enviar(telefono, producto, consumidor_opcional 
     if (!orden) return { ok: false, error: "NO_ORDER" };
 
     // Limpiamos un poco el nombre que manda la IA (quitamos 'con queso', etc para buscar mejor)
-    const palabraClave = producto.split(" ")[0]; // Ej: Si manda "Choripan con queso", solo busca "Choripan"
+    const palabraClave = String(producto || "").trim().split(" ")[0]; // Ej: Si manda "Choripan con queso", solo busca "Choripan"
 
     // Buscamos el platillo usando .ilike() que permite buscar coincidencias parciales sin importar mayúsculas
     let query = supabase
@@ -333,6 +401,16 @@ async function confirmar_comanda_cocina(telefono) {
       .eq("enviado_cocina", false);
 
     if (errUpdate) throw errUpdate;
+    const { error: errKdsEvent } = await supabase
+  .from("kds_events")
+  .insert({
+    orden_id: orden.id,
+    items_count: pendientes.length
+  });
+
+if (errKdsEvent) {
+  console.error("No se pudo registrar kds_event:", errKdsEvent.message);
+}
 
     // --- FUNCIÓN RECUPERADA: Actualizar fecha de última compra ---
     try {
@@ -674,6 +752,7 @@ module.exports = {
   consultar_menu,
   asegurar_orden_abierta,
   previsualizar_pedido,
+  mapRetailerIdsToMenuItems,
   cancelar_item_sin_enviar,
   cancelar_orden_completa,
 
