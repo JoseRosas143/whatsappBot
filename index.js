@@ -636,8 +636,7 @@ async function goOrderingFlow(from, s) {
   await sendNativeCatalogFlow(from, s);
 }
 
-// -------------------- Consola web mínima --------------------
-// -------------------- Consola web mínima (Estilizada) --------------------
+// -------------------- Consola web mínima (Estilizada y para App Review) --------------------
 function adminConsoleAuth(req, res, next) {
   const token = req.query.token || req.headers["x-admin-token"];
   if (!ADMIN_CONSOLE_TOKEN || token !== ADMIN_CONSOLE_TOKEN) {
@@ -663,6 +662,9 @@ const htmlHeader = `
     a:hover { text-decoration: underline; color: #0d47a1; }
     .btn { background: #d32f2f; color: white; border: none; padding: 10px 20px; border-radius: 8px; cursor: pointer; font-size: 16px; font-weight: bold; transition: 0.2s; }
     .btn:hover { background: #b71c1c; }
+    .btn:disabled { background: #ccc; cursor: not-allowed; }
+    .btn-quick { background: #e0e0e0; color: #333; border: none; padding: 6px 12px; border-radius: 6px; cursor: pointer; font-size: 13px; margin-right: 5px; margin-bottom: 5px; transition: 0.2s; }
+    .btn-quick:hover { background: #bdbdbd; }
     textarea { width: 100%; box-sizing: border-box; padding: 12px; border: 1px solid #ccc; border-radius: 8px; font-family: inherit; font-size: 15px; resize: vertical; margin-bottom: 10px; }
     textarea:focus { outline: none; border-color: #d32f2f; box-shadow: 0 0 5px rgba(211,47,47,0.3); }
   </style>
@@ -736,50 +738,104 @@ async function renderConsoleChat(tel, token) {
             <a href="/console?token=${token}" style="background: #eee; padding: 8px 12px; border-radius: 8px; color: #333;">⬅ Volver</a>
           </div>
           <hr style="border: none; border-top: 1px solid #eee; margin-bottom: 20px;" />
+
+          <div style="background: #e3f2fd; padding: 20px; border-radius: 12px; margin-bottom: 20px; border: 1px solid #90caf9;">
+            <h3 style="margin-top:0; color: #1565c0; font-size: 16px;">🛡️ Panel de Pruebas (Meta App Review)</h3>
+            
+            <div style="margin-bottom: 10px;">
+              <button class="btn-quick" onclick="document.getElementById('demoText').value='Prueba App Review Meta - mensaje enviado desde mi aplicación independiente.'">Mensaje App Review</button>
+              <button class="btn-quick" onclick="document.getElementById('demoText').value='Hola, este es un saludo de prueba para revisión.'">Saludo Demo</button>
+              <button class="btn-quick" onclick="document.getElementById('demoText').value='Mensaje de prueba con Timestamp: ' + new Date().toISOString()">Timestamp</button>
+            </div>
+
+            <textarea id="demoText" rows="2">Prueba App Review Meta - mensaje enviado desde mi aplicación independiente.</textarea>
+            
+            <div style="display: flex; gap: 10px; flex-wrap: wrap;">
+              <button id="btnDemoSend" class="btn" style="background: #1565c0;" onclick="sendDemoMessage('${tel}', '${token}')">🚀 Enviar mensaje de prueba</button>
+              <a href="https://wa.me/${tel}" target="_blank" class="btn" style="background: #2e7d32; text-decoration: none; display: inline-flex; align-items: center;">🟢 Abrir WhatsApp Web</a>
+            </div>
+
+            <pre id="demoResult" style="background: #222; color: #0f0; padding: 15px; border-radius: 8px; display: none; overflow-x: auto; margin-top: 15px; font-size: 13px;"></pre>
+          </div>
           
-          <div id="chat-box" style="background: #fafafa; padding: 20px; border: 1px solid #ddd; border-radius: 12px; max-height: 500px; overflow-y: auto; margin-bottom: 20px;">
-            ${msgs || "<div style='text-align:center; color:#888;'>No hay mensajes en el historial</div>"}
+          <div id="chat-box" style="background: #fafafa; padding: 20px; border: 1px solid #ddd; border-radius: 12px; height: 400px; overflow-y: auto; margin-bottom: 20px;">
+            <div id="chat-messages">
+              ${msgs || "<div style='text-align:center; color:#888;'>No hay mensajes en el historial</div>"}
+            </div>
           </div>
           
           <form method="POST" action="/console/send?token=${token}" style="margin: 0;">
             <input type="hidden" name="tel" value="${tel}" />
-            <textarea name="text" rows="3" placeholder="Escribe aquí tu respuesta como humano..." required></textarea>
+            <textarea name="text" rows="2" placeholder="Escribe respuesta como soporte normal..."></textarea>
             <div style="text-align: right;">
-              <button type="submit" class="btn">🚀 Enviar Mensaje</button>
+              <button type="submit" class="btn">Enviar Soporte Normal</button>
             </div>
           </form>
         </div>
-        
+
         <script>
+          // 1. Script para enviar el mensaje Demo sin recargar (AJAX)
+          async function sendDemoMessage(tel, token) {
+            const btn = document.getElementById('btnDemoSend');
+            const resultBox = document.getElementById('demoResult');
+            const text = document.getElementById('demoText').value;
+            
+            if(!text.trim()) return alert("El mensaje no puede estar vacío");
+
+            btn.disabled = true;
+            btn.innerText = "Enviando...";
+            resultBox.style.display = 'block';
+            resultBox.innerText = "Procesando petición...";
+
+            try {
+              const res = await fetch('/console/send-demo?token=' + token, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ tel, text })
+              });
+              const json = await res.json();
+              
+              // Mostramos el JSON en pantalla para que Meta lo vea en el video
+              resultBox.innerText = JSON.stringify(json, null, 2);
+              if(!json.ok) resultBox.style.color = "#ff5252";
+              else resultBox.style.color = "#00e676";
+              
+            } catch(e) {
+              resultBox.style.color = "#ff5252";
+              resultBox.innerText = "Error de red: " + e.message;
+            } finally {
+              btn.disabled = false;
+              btn.innerText = "🚀 Enviar mensaje de prueba";
+            }
+          }
+
+          // 2. Script Auto-Update (Corregido con wrapper invisible)
           const chatBox = document.getElementById('chat-box');
+          const chatMessages = document.getElementById('chat-messages');
+          
+          // Scroll inicial al fondo
           if(chatBox) chatBox.scrollTop = chatBox.scrollHeight;
 
-          // Magia Ninja: Preguntar por mensajes nuevos cada 3 segundos
           setInterval(async () => {
             try {
               const response = await fetch(window.location.href);
-              const text = await response.text();
+              const htmlText = await response.text();
               
-              // Extraemos solo la caja de chat de la respuesta invisible
               const parser = new DOMParser();
-              const doc = parser.parseFromString(text, 'text/html');
-              const newChatContent = doc.getElementById('chat-box').innerHTML;
+              const doc = parser.parseFromString(htmlText, 'text/html');
+              const newContent = doc.getElementById('chat-messages').innerHTML;
 
-              // Si hay cambios, actualizamos la pantalla
-              if (chatBox.innerHTML !== newChatContent) {
-                // Revisamos si el usuario estaba viendo los mensajes más recientes
-                const isScrolledToBottom = chatBox.scrollHeight - chatBox.clientHeight <= chatBox.scrollTop + 50;
+              if (chatMessages.innerHTML !== newContent) {
+                // Checamos si el usuario estaba viendo lo más reciente
+                const isAtBottom = chatBox.scrollHeight - chatBox.clientHeight <= chatBox.scrollTop + 50;
                 
-                chatBox.innerHTML = newChatContent;
+                chatMessages.innerHTML = newContent; // Solo actualizamos los mensajes
                 
-                // Si estaba hasta abajo, lo mantenemos hasta abajo
-                if (isScrolledToBottom) {
+                if (isAtBottom) {
                   chatBox.scrollTop = chatBox.scrollHeight;
                 }
               }
-            } catch (err) {
-              console.error("Error silenciado al actualizar chat:", err);
-            }
+            } catch (err) { /* Errores de red silenciados para no llenar la consola */ }
           }, 3000);
         </script>
       </body>
@@ -812,6 +868,35 @@ app.post("/console/send", adminConsoleAuth, async (req, res) => {
   if (!tel || !text) return res.status(400).send("Falta tel/text");
   await sendText(tel, `🧑‍💼 Soporte: ${text}`);
   res.redirect(`/console/chat?tel=${tel}&token=${req.adminToken}`);
+});
+
+// NUEVO ENDPOINT PARA META APP REVIEW (JSON Response)
+app.post("/console/send-demo", adminConsoleAuth, async (req, res) => {
+  const tel = String(req.body.tel || "");
+  const text = String(req.body.text || "").trim();
+  
+  if (!tel || !text) {
+    return res.status(400).json({ ok: false, error: "Faltan parámetros: teléfono o texto." });
+  }
+
+  try {
+    // Mandamos el mensaje directo sin guardarlo en el historial de IA para no ensuciar la sesión
+    await sendText(tel, text, { skipSave: true }); 
+    
+    // Respondemos con el JSON de éxito que el revisor de Meta quiere ver
+    res.json({
+      ok: true,
+      status: "sent",
+      recipient: tel,
+      message_body: text,
+      timestamp: new Date().toISOString()
+    });
+  } catch (err) {
+    res.status(500).json({
+      ok: false,
+      error: err.message || "Error al comunicarse con la API de WhatsApp."
+    });
+  }
 });
 
 // Webhook verify
