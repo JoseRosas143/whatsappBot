@@ -637,36 +637,125 @@ async function goOrderingFlow(from, s) {
 }
 
 // -------------------- Consola web mínima --------------------
+// -------------------- Consola web mínima (Estilizada) --------------------
 function adminConsoleAuth(req, res, next) {
   const token = req.query.token || req.headers["x-admin-token"];
-  if (!ADMIN_CONSOLE_TOKEN || token !== ADMIN_CONSOLE_TOKEN) return res.status(401).send("Unauthorized");
+  if (!ADMIN_CONSOLE_TOKEN || token !== ADMIN_CONSOLE_TOKEN) {
+    return res.status(401).send(`
+      <body style="font-family: sans-serif; background: #f4f6f8; display: flex; justify-content: center; align-items: center; height: 100vh;">
+        <div style="background: white; padding: 40px; border-radius: 12px; box-shadow: 0 4px 12px rgba(0,0,0,0.1); text-align: center;">
+          <h2 style="color: #d32f2f;">🛑 Acceso Denegado</h2>
+          <p>Contraseña incorrecta o faltante.</p>
+        </div>
+      </body>
+    `);
+  }
+  req.adminToken = token;
   next();
 }
 
-async function renderConsoleHome() {
-  const { data, error } = await tools.supabase.from("bot_sessions").select("telefono, updated_at").order("updated_at", { ascending: false }).limit(50);
-  if (error) return `<h3>Error</h3><pre>${error.message}</pre>`;
-  const rows = (data || []).map((r) => `<li><a href="/console/chat?tel=${r.telefono}">${r.telefono}</a> <small>${r.updated_at}</small></li>`).join("");
-  return `<h2>LCDc Bot Console</h2><p>Chats recientes:</p><ul>${rows || "<li>Sin sesiones</li>"}</ul>`;
+const htmlHeader = `
+  <style>
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; background-color: #f0f2f5; margin: 0; padding: 20px; color: #333; }
+    .container { max-width: 800px; margin: 0 auto; background: #fff; border-radius: 12px; box-shadow: 0 4px 15px rgba(0,0,0,0.05); padding: 30px; }
+    h2 { color: #b71c1c; border-bottom: 2px solid #ffeeee; padding-bottom: 10px; margin-top: 0; }
+    a { color: #1976d2; text-decoration: none; font-weight: 500; }
+    a:hover { text-decoration: underline; color: #0d47a1; }
+    .btn { background: #d32f2f; color: white; border: none; padding: 10px 20px; border-radius: 8px; cursor: pointer; font-size: 16px; font-weight: bold; transition: 0.2s; }
+    .btn:hover { background: #b71c1c; }
+    textarea { width: 100%; box-sizing: border-box; padding: 12px; border: 1px solid #ccc; border-radius: 8px; font-family: inherit; font-size: 15px; resize: vertical; margin-bottom: 10px; }
+    textarea:focus { outline: none; border-color: #d32f2f; box-shadow: 0 0 5px rgba(211,47,47,0.3); }
+  </style>
+`;
+
+async function renderConsoleHome(token) {
+  const { data, error } = await tools.supabase
+    .from("bot_sessions")
+    .select("telefono, updated_at")
+    .order("updated_at", { ascending: false })
+    .limit(50);
+    
+  if (error) return `<div class="container"><h3>Error</h3><pre>${error.message}</pre></div>`;
+
+  const rows = (data || []).map((r) => {
+    const date = new Date(r.updated_at).toLocaleString('es-MX', { timeZone: 'America/Mexico_City' });
+    return `<li style="padding: 15px; border-bottom: 1px solid #eee; display: flex; justify-content: space-between; align-items: center;">
+      <a href="/console/chat?tel=${r.telefono}&token=${token}" style="font-size: 17px;">📱 ${r.telefono}</a> 
+      <small style="color: #888; background: #f9f9f9; padding: 4px 8px; border-radius: 12px;">⏱️ ${date}</small>
+    </li>`;
+  }).join("");
+
+  return `
+    <html>
+      <head><title>Consola LCDC</title>${htmlHeader}</head>
+      <body>
+        <div class="container">
+          <h2>🏠 La Casita - Centro de Mando</h2>
+          <p style="color: #666; font-size: 15px;">Selecciona un chat reciente para espiar o intervenir:</p>
+          <ul style="list-style: none; padding: 0; margin: 0;">${rows || "<li style='padding:15px; color:#888;'>Sin sesiones activas</li>"}</ul>
+        </div>
+      </body>
+    </html>
+  `;
 }
 
-async function renderConsoleChat(tel) {
-  const { data, error } = await tools.supabase.from("chat_messages").select("direction,text,created_at").eq("telefono", tel).order("created_at", { ascending: false }).limit(80);
-  if (error) return `<h3>Error</h3><pre>${error.message}</pre>`;
+async function renderConsoleChat(tel, token) {
+  const { data, error } = await tools.supabase
+    .from("chat_messages")
+    .select("direction,text,created_at")
+    .eq("telefono", tel)
+    .order("created_at", { ascending: false })
+    .limit(80);
+    
+  if (error) return `<div class="container"><h3>Error</h3><pre>${error.message}</pre></div>`;
+
   const msgs = (data || []).reverse().map((m) => {
-    const who = m.direction === "in" ? "Cliente" : "Bot/Staff";
-    return `<div style="margin:6px 0;"><b>${who}</b> <small>${m.created_at}</small><br/>${(m.text || "").replace(/</g, "&lt;")}</div>`;
+    const isClient = m.direction === "in";
+    const align = isClient ? "left" : "right";
+    const bgColor = isClient ? "#e3f2fd" : "#ffebee";
+    const who = isClient ? "🧑 Cliente" : "🤖 Beto / 🧑‍💼 Staff";
+    const time = new Date(m.created_at).toLocaleTimeString('es-MX', { timeZone: 'America/Mexico_City', hour: '2-digit', minute:'2-digit' });
+    
+    return `
+      <div style="text-align: ${align}; margin-bottom: 15px;">
+        <div style="display: inline-block; max-width: 75%; background: ${bgColor}; padding: 12px 16px; border-radius: 16px; text-align: left; box-shadow: 0 1px 2px rgba(0,0,0,0.05);">
+          <div style="font-size: 12px; color: #555; margin-bottom: 4px; font-weight: 600;">${who} <span style="font-weight: normal; font-size: 11px; float: right; margin-left: 10px;">${time}</span></div>
+          <div style="font-size: 15px; line-height: 1.4; word-wrap: break-word;">${(m.text || "").replace(/</g, "&lt;").replace(/\n/g, "<br/>")}</div>
+        </div>
+      </div>
+    `;
   }).join("");
+
   return `
-    <h2>Chat: ${tel}</h2>
-    <div style="padding:10px;border:1px solid #ddd;border-radius:8px;max-width:900px;">${msgs || "Sin mensajes"}</div>
-    <hr/>
-    <form method="POST" action="/console/send">
-      <input type="hidden" name="tel" value="${tel}" />
-      <textarea name="text" rows="3" style="width:900px" placeholder="Escribe respuesta humana..."></textarea><br/>
-      <button type="submit">Enviar</button>
-    </form>
-    <p><a href="/console">⬅ Volver</a></p>
+    <html>
+      <head><title>Chat ${tel}</title>${htmlHeader}</head>
+      <body>
+        <div class="container">
+          <div style="display: flex; justify-content: space-between; align-items: center;">
+            <h2 style="margin: 0; border: none;">💬 Chat: ${tel}</h2>
+            <a href="/console?token=${token}" style="background: #eee; padding: 8px 12px; border-radius: 8px; color: #333;">⬅ Volver</a>
+          </div>
+          <hr style="border: none; border-top: 1px solid #eee; margin-bottom: 20px;" />
+          
+          <div style="background: #fafafa; padding: 20px; border: 1px solid #ddd; border-radius: 12px; max-height: 500px; overflow-y: auto; margin-bottom: 20px;">
+            ${msgs || "<div style='text-align:center; color:#888;'>No hay mensajes en el historial</div>"}
+          </div>
+          
+          <form method="POST" action="/console/send?token=${token}" style="margin: 0;">
+            <input type="hidden" name="tel" value="${tel}" />
+            <textarea name="text" rows="3" placeholder="Escribe aquí tu respuesta como humano..." required></textarea>
+            <div style="text-align: right;">
+              <button type="submit" class="btn">🚀 Enviar Mensaje</button>
+            </div>
+          </form>
+        </div>
+        <script>
+          // Auto-scroll al final del chat al cargar la página
+          const chatDiv = document.querySelector('div[style*="overflow-y: auto"]');
+          if(chatDiv) chatDiv.scrollTop = chatDiv.scrollHeight;
+        </script>
+      </body>
+    </html>
   `;
 }
 
@@ -678,19 +767,23 @@ app.use(express.urlencoded({ extended: true }));
 app.get("/", (_req, res) => res.json({ ok: true }));
 app.get("/health", (_req, res) => res.json({ ok: true }));
 
-// Consola
-app.get("/console", adminConsoleAuth, async (_req, res) => { const html = await renderConsoleHome(); res.send(html); });
+// Consola Rutas
+app.get("/console", adminConsoleAuth, async (req, res) => { 
+  res.send(await renderConsoleHome(req.adminToken)); 
+});
+
 app.get("/console/chat", adminConsoleAuth, async (req, res) => {
   const tel = String(req.query.tel || "");
   if (!tel) return res.status(400).send("Falta tel");
-  res.send(await renderConsoleChat(tel));
+  res.send(await renderConsoleChat(tel, req.adminToken));
 });
+
 app.post("/console/send", adminConsoleAuth, async (req, res) => {
   const tel = String(req.body.tel || "");
   const text = String(req.body.text || "").trim();
   if (!tel || !text) return res.status(400).send("Falta tel/text");
   await sendText(tel, `🧑‍💼 Soporte: ${text}`);
-  res.redirect(`/console/chat?tel=${tel}`);
+  res.redirect(`/console/chat?tel=${tel}&token=${req.adminToken}`);
 });
 
 // Webhook verify
