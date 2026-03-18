@@ -737,7 +737,7 @@ async function renderConsoleChat(tel, token) {
           </div>
           <hr style="border: none; border-top: 1px solid #eee; margin-bottom: 20px;" />
           
-          <div style="background: #fafafa; padding: 20px; border: 1px solid #ddd; border-radius: 12px; max-height: 500px; overflow-y: auto; margin-bottom: 20px;">
+          <div id="chat-box" style="background: #fafafa; padding: 20px; border: 1px solid #ddd; border-radius: 12px; max-height: 500px; overflow-y: auto; margin-bottom: 20px;">
             ${msgs || "<div style='text-align:center; color:#888;'>No hay mensajes en el historial</div>"}
           </div>
           
@@ -749,10 +749,38 @@ async function renderConsoleChat(tel, token) {
             </div>
           </form>
         </div>
+        
         <script>
-          // Auto-scroll al final del chat al cargar la página
-          const chatDiv = document.querySelector('div[style*="overflow-y: auto"]');
-          if(chatDiv) chatDiv.scrollTop = chatDiv.scrollHeight;
+          const chatBox = document.getElementById('chat-box');
+          if(chatBox) chatBox.scrollTop = chatBox.scrollHeight;
+
+          // Magia Ninja: Preguntar por mensajes nuevos cada 3 segundos
+          setInterval(async () => {
+            try {
+              const response = await fetch(window.location.href);
+              const text = await response.text();
+              
+              // Extraemos solo la caja de chat de la respuesta invisible
+              const parser = new DOMParser();
+              const doc = parser.parseFromString(text, 'text/html');
+              const newChatContent = doc.getElementById('chat-box').innerHTML;
+
+              // Si hay cambios, actualizamos la pantalla
+              if (chatBox.innerHTML !== newChatContent) {
+                // Revisamos si el usuario estaba viendo los mensajes más recientes
+                const isScrolledToBottom = chatBox.scrollHeight - chatBox.clientHeight <= chatBox.scrollTop + 50;
+                
+                chatBox.innerHTML = newChatContent;
+                
+                // Si estaba hasta abajo, lo mantenemos hasta abajo
+                if (isScrolledToBottom) {
+                  chatBox.scrollTop = chatBox.scrollHeight;
+                }
+              }
+            } catch (err) {
+              console.error("Error silenciado al actualizar chat:", err);
+            }
+          }, 3000);
         </script>
       </body>
     </html>
